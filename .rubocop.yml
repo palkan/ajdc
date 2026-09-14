@@ -1,0 +1,33 @@
+inherit_mode:
+  merge:
+    - Exclude
+
+plugins:
+  - standard-custom
+  - standard-performance
+  - rubocop-performance
+  - rubocop-rails
+
+inherit_gem:
+  standard: config/base.yml
+  standard-performance: config/base.yml
+  standard-custom: config/base.yml
+  standard-rails: config/base.yml
+
+AllCops:
+  Exclude:
+    - 'bin/*'
+    - 'tmp/**/*'
+    - 'Gemfile'
+    - 'vendor/**/*'
+    - 'gemfiles/**/*'
+    - 'lib/.rbnext/**/*'
+    - 'lib/generators/**/templates/*.rb'
+    - '.github/**/*'
+  DisplayCopNames: true
+  SuggestExtensions: false
+  NewCops: disable
+  TargetRubyVersion: 3.3
+
+Style/FrozenStringLiteralComment:
+  Enabled: true

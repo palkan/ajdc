@@ -1,0 +1,4 @@
+bump:
+  file: lib/ajdc/version.rb
+  skip_ci: true
+
