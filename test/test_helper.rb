@@ -35,6 +35,7 @@ ActiveJob::Durable::Record.connection_pool.with_connection do |connection|
   connection.drop_table :active_job_durable_runs, if_exists: true
 end
 load File.expand_path("../db/durable_schema.rb", __dir__)
+load File.expand_path("dummy/db/schema.rb", __dir__)
 
 Dir["#{__dir__}/support/**/*.rb"].sort.each { |f| require f }
 

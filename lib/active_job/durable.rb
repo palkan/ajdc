@@ -146,11 +146,11 @@ module ActiveJob
       raise RunNotFoundError, "Run #{run_id} for #{self.class.name} (Job ID: #{job_id}) was not found" unless run
 
       @durable_run = run
-      @durable_state_written = run.state
+      @durable_state_written = run.serialized_state
       self.resumptions = run.resumptions
       self.continuation = Continuation.new(self, durable_serialized_progress(run))
       if run.state.present? && respond_to?(:deserialize_attribute_values, true)
-        deserialize_attribute_values(run.state)
+        deserialize_attribute_values(run.serialized_state)
       end
     end
 
