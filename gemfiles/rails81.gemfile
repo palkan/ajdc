@@ -1,6 +1,8 @@
 source "https://rubygems.org"
 
 gem "rails", "~> 8.1.0"
+# json 3.x made JSON.parse keyword-only; ActiveSupport::JSON.decode in 8.1 still passes options positionally.
+gem "json", "< 3"
 gem "sqlite3", "~> 2.0"
 
 gemspec path: ".."

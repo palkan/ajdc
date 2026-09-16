@@ -1,0 +1,58 @@
+# frozen_string_literal: true
+
+# Tables for ActiveJob::Durable: one row per run, one row per step attempt.
+#
+# JSON columns hold Active Job-serialized values (ActiveJob::Arguments.serialize),
+# nothing in them is indexed. They carry no database defaults so that the same
+# file loads on SQLite, PostgreSQL and MySQL; the models set the defaults.
+ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "active_job_durable_runs", if_not_exists: true do |t|
+    t.string "job_class", null: false
+    t.string "key", null: false
+    t.string "active_key"
+    t.string "active_job_id", null: false
+    t.json "arguments", null: false
+    t.string "status", null: false
+    t.string "current_step"
+    t.json "completed_steps", null: false
+    t.json "state", null: false
+    t.datetime "waiting_until"
+    t.datetime "timeout_at"
+    t.json "pending_signals", null: false
+    t.json "parked_job"
+    t.integer "resumptions", default: 0, null: false
+    t.datetime "last_heartbeat_at"
+    t.string "error_class"
+    t.text "error_message"
+    t.string "halt_reason"
+    t.datetime "started_at"
+    t.datetime "finished_at"
+    t.datetime "transitioned_at"
+    t.timestamps
+
+    t.index ["job_class", "active_key"], name: "index_active_job_durable_runs_on_active_key", unique: true
+    t.index ["job_class", "key"], name: "index_active_job_durable_runs_on_key"
+    t.index ["active_job_id"], name: "index_active_job_durable_runs_on_active_job_id", unique: true
+    t.index ["status"], name: "index_active_job_durable_runs_on_status"
+    t.index ["waiting_until"], name: "index_active_job_durable_runs_on_waiting_until"
+    t.index ["status", "transitioned_at"], name: "index_active_job_durable_runs_on_status_and_transitioned_at"
+  end
+
+  create_table "active_job_durable_steps", if_not_exists: true do |t|
+    t.references "run", null: false, index: false,
+      foreign_key: {to_table: "active_job_durable_runs", on_delete: :cascade}
+    t.string "name", null: false
+    t.integer "position", null: false
+    t.integer "attempt", default: 1, null: false
+    t.string "status", null: false
+    t.json "cursor"
+    t.boolean "isolated", default: false, null: false
+    t.string "error_class"
+    t.text "error_message"
+    t.datetime "started_at"
+    t.datetime "finished_at"
+
+    t.index ["run_id", "name", "attempt"], name: "index_active_job_durable_steps_on_attempt", unique: true
+    t.index ["run_id", "position"], name: "index_active_job_durable_steps_on_position"
+  end
+end

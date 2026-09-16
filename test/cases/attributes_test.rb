@@ -139,7 +139,7 @@ class ActiveJob::AttributesTest < ActiveSupport::TestCase
   end
 
   class ContinuableAttributeJob < ActiveJob::Base
-    include ActiveJob::Continuable
+    include ActiveJob::Durable
 
     attribute :processed_count, :integer, default: 0
 

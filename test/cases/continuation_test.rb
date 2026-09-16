@@ -12,7 +12,7 @@ class ActiveJob::TestContinuation < ActiveSupport::TestCase
   include TestLoggerHelper
 
   class ContinuableJob < ActiveJob::Base
-    include ActiveJob::Continuable
+    include ActiveJob::Durable
   end
 
   IteratingRecord = Struct.new(:id, :name) do
@@ -780,8 +780,8 @@ class ActiveJob::TestContinuation < ActiveSupport::TestCase
           if step.resumed?
             self.class.resumed_cursor = step.cursor
           else
+            self.class.serialized_job = serialize # the payload only references the run; the row carries the cursor
             step.set! self.class.cursor_value
-            self.class.serialized_job = serialize
           end
         end
       end
@@ -790,7 +790,10 @@ class ActiveJob::TestContinuation < ActiveSupport::TestCase
     test "round-trips a non-primitive step cursor through Active Job argument serialization" do
       SerializableCursorJob.cursor_value = Date.new(2026, 7, 6)
       SerializableCursorJob.resumed_cursor = nil
-      SerializableCursorJob.perform_now
+      # Interrupt at the checkpoint after set!, so the run row holds the mid-step cursor.
+      queue_adapter.with(stopping: ->(job) { job.is_a?(SerializableCursorJob) }) do
+        SerializableCursorJob.perform_now
+      end
 
       round_tripped = JSON.parse(JSON.generate(SerializableCursorJob.serialized_job))
       ActiveJob::Base.execute(round_tripped)

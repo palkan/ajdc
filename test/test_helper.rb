@@ -26,6 +26,16 @@ def rails_version_is(range, &)
   end
 end
 
+# Create the primary test database when it is not SQLite (which is created on connect),
+# then (re)load the gem's schema into it, so the suite runs from a clean checkout.
+ActiveRecord::Tasks::DatabaseTasks.create_current("test", "primary") unless ENV["TARGET_DB"] == "sqlite"
+ActiveRecord::Schema.verbose = false
+ActiveJob::Durable::Record.connection_pool.with_connection do |connection|
+  connection.drop_table :active_job_durable_steps, if_exists: true
+  connection.drop_table :active_job_durable_runs, if_exists: true
+end
+load File.expand_path("../db/durable_schema.rb", __dir__)
+
 Dir["#{__dir__}/support/**/*.rb"].sort.each { |f| require f }
 
 require "minitest/autorun"

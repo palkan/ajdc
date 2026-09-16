@@ -33,6 +33,8 @@ pkg/
 spec/dummy/db/*.sqlite3
 spec/dummy/db/*.sqlite3-journal
 spec/dummy/tmp/
+test/dummy/db/*.sqlite3
+test/dummy/db/*.sqlite3-*
 
 Gemfile.lock
 Gemfile.local*
