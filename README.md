@@ -3,6 +3,9 @@
 
 # AJ/DC: Active Job Durable Continuation
 
+<img align="right" height="150" width="292"
+     title="AJ/DC logo" src="./assets/logo.png">
+
 AJ/DC makes an `ActiveJob::Continuable` job's run and steps durable: they're recorded in the database, not only in the job payload, so progress survives a crash, not only a graceful restart.
 
 ## Installation
