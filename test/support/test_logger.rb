@@ -26,7 +26,5 @@ module TestLoggerHelper
     set_logger @old_logger
   end
 
-  def set_logger(logger)
-    ActiveJob::Base.logger = logger
-  end
+  def set_logger(logger) = ActiveJob::Base.logger = logger
 end

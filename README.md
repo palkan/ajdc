@@ -95,15 +95,63 @@ run.state            # => {"processed_count" => 128}
 run.steps.map(&:name) # => ["validate", "process"]
 ```
 
-`status` is one of `enqueued`, `running`, `completed`, `failed`, `discarded`. `discarded` means Active Job handled the error (`discard_on`, or a `retry_on` that ran out of attempts and had a block); `failed` means the error was raised to the queue backend.
-
 ### Uniqueness
 
 TBD
 
 ### Reading runs
 
-TBD
+A job class knows its runs, newest first. `workflow_runs` is an Active Record relation, so the scopes below chain onto it:
+
+```ruby
+ImportJob.workflow_runs
+ImportJob.workflow_runs.failed.at_step(:process)
+```
+
+`for` finds the runs `perform_later` would have created with the same arguments; it derives the key the same way. `for(workflow_key:)` matches a key verbatim:
+
+```ruby
+ImportJob.workflow_runs.for(import)                       # same key as ImportJob.perform_later(import)
+ImportJob.workflow_runs.for(workflow_key: "imports/42")
+ImportJob.workflow_runs.for(import).live.first            # the run in progress, or nil
+```
+
+Without a declaration, every argument is part of the key: positional arguments in order, then keywords sorted by name as `name=value`. A record renders as `collection/id`; a value that is not a string, symbol, number or boolean becomes a short digest:
+
+```ruby
+ImportJob.perform_later(import, "csv", strict: true)      # key "imports/42:csv:strict=true"
+```
+
+`identified_by` narrows the key to the named `perform` parameters, positional or keyword:
+
+```ruby
+class ImportJob < ApplicationJob
+  include ActiveJob::Durable
+
+  identified_by :import   # key "imports/42", whatever the other arguments
+
+  def perform(import, format = "csv", strict: false)
+    # ...
+  end
+end
+```
+
+The block form receives the `perform` arguments and returns one component or an array of them:
+
+```ruby
+identified_by { |import, **kwargs| [import, kwargs.fetch(:format, "csv")] }   # key "imports/42:csv"
+```
+
+A name that is not a `perform` parameter raises `ArgumentError`: at the declaration when the class already defines `perform`, otherwise at the first `perform_later`.
+
+Other usefule scopes:
+
+```ruby
+MyJob.workflow_runs.live  # enqueued, running, waiting, awaiting
+MyJob.workflow_runs.at_step(:process)
+MyJob.workflow_runs.stuck_for(1.hour)
+MyJob.workflow_runs.newest_first
+```
 
 ### Timers
 

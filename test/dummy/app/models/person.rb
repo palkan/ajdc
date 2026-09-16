@@ -22,11 +22,7 @@ class Person
     end
   end
 
-  def initialize(id)
-    @id = id
-  end
+  def initialize(id) = @id = id
 
-  def ==(other)
-    other.is_a?(Person) && id.to_s == other.id.to_s
-  end
+  def ==(other) = other.is_a?(Person) && id.to_s == other.id.to_s
 end

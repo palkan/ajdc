@@ -13,7 +13,6 @@ begin
   require_relative "../test/dummy/config/environment"
   ActiveRecord::Migrator.migrations_paths = [File.expand_path("../test/dummy/db/migrate", __dir__)]
 rescue => e
-  # Fail fast if application couldn't be loaded
   $stdout.puts "Failed to load the app: #{e.message}\n#{e.backtrace.take(5).join("\n")}"
   exit(1)
 end

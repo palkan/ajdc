@@ -10,7 +10,7 @@ module ActiveJob
   # = Active Job Durable
   #
   # A Continuable job whose run is also a record. Include it instead of
-  # ActiveJob::Continuable:
+  # `ActiveJob::Continuable`:
   #
   #   class ProcessImportJob < ApplicationJob
   #     include ActiveJob::Durable
@@ -21,27 +21,13 @@ module ActiveJob
   #     end
   #   end
   #
-  # Steps, cursors and attributes behave exactly as in ActiveJob::Continuable,
-  # but the run row is the single source of truth: the job payload carries
-  # +"durable_run_id"+ instead of the +"continuation"+, +"attributes"+ and
-  # +"resumptions"+ keys, and every execution rebuilds the Continuation, the
-  # attribute values and the resumption count from +active_job_durable_runs+ and
-  # the current attempt in +active_job_durable_steps+. The rows are written
-  # before the job is re-enqueued, in every path. The class patches the following
-  # Active Job methods:
-  #
-  # * +enqueue+ creates the run (inside the caller's transaction) or, on a retry
-  #   or resume, marks it +enqueued+ again and commits the attribute values;
-  # * an +around_perform+ callback wrapping Continuable's +continue+ marks the
-  #   run +running+, then +completed+;
-  # * +step+ records a step row when the body starts and completes it when the
-  #   body returns;
-  # * +checkpoint!+ commits the current cursor and the attribute values;
-  # * +resume_job+ closes the step row as +interrupted+ (or +failed+) and commits
-  #   the attribute values before the job is re-enqueued;
-  # * +perform_now+ marks the run +discarded+ when Active Job swallowed the error
-  #   (+discard_on+, an exhausted +retry_on+ with a block) and +failed+ when the
-  #   error is raised to the queue backend.
+  # Steps, cursors and attributes behave exactly as in `ActiveJob::Continuable`,
+  # but the run row is the single source of truth: the payload carries
+  # `"durable_run_id"` instead of `"continuation"`, `"attributes"` and
+  # `"resumptions"`, and every execution rebuilds the continuation, the attribute
+  # values and the resumption count from `active_job_durable_runs` and the
+  # current attempt in `active_job_durable_steps`. The rows are written before
+  # the job is re-enqueued, in every path.
   module Durable
     extend ActiveSupport::Concern
     include ActiveJob::Continuable
@@ -50,35 +36,77 @@ module ActiveJob
     autoload :Run, "active_job/durable/run"
     autoload :Step, "active_job/durable/step"
 
-    # Database configuration for the durable tables, see ActiveJob::Durable::Record.
     mattr_accessor :connects_to, instance_accessor: false
 
-    # +last_heartbeat_at+ is refreshed at most once per interval; the cursor is
+    # `last_heartbeat_at` is refreshed at most once per interval; the cursor is
     # still committed at every checkpoint.
     HEARTBEAT_INTERVAL = 5.seconds
 
-    # Raised inside +perform_now+ when the payload references a run row that does
-    # not exist (or belongs to another job), where +retry_on+, +discard_on+ and
-    # +rescue_from+ handlers can see it.
+    # Raised inside `perform_now` when the payload references a run row that does
+    # not exist (or belongs to another job), so `retry_on`, `discard_on` and
+    # `rescue_from` handlers can see it.
     class RunNotFoundError < StandardError; end
 
     included do
-      # Continuable registers +around_perform :continue+ when it is included, before
-      # this block runs. Callback chains run the first registered around callback
-      # outermost, so prepending is what makes this callback wrap +continue+: an
-      # interrupt or a resumable error is handled inside, and only what escapes
-      # +continue+ is a failure.
+      class_attribute :durable_identity, instance_writer: false
+
+      # Add our hook before Continuable's `around_perform :continue`,
+      # so we can wrap it
       around_perform :durable_perform, prepend: true
 
-      # Active Job runs these for every exception that leaves +perform_now+, not
-      # only for +discard_on+ (ActiveJob::Execution#perform_now); +perform_now+
-      # below decides between +discarded+ and +failed+ once the outcome is known.
       after_discard { |_job, error| @durable_discarded_error = error }
+    end
+
+    module ClassMethods
+      # Names the components of a run's `key`: `perform` parameters (positional by
+      # name, keywords by key), or a block called with the `perform` arguments
+      # whose return value is the key (rendered like any component, or joined
+      # with ":" when it is an array):
+      #
+      #   identified_by :card                 # key "cards/42", whatever the other arguments
+      #   identified_by :card, :style         # key "cards/42:plain" for perform(card, style: "plain")
+      #   identified_by { |card, **| [card.account, :export] }
+      #
+      # A name that is not a `perform` parameter raises `ArgumentError`.
+      #
+      # Without a declaration every argument is a component: positional in order,
+      # then keywords sorted by name as `name=value`.
+      def identified_by(*names, &block)
+        durable_check_identity!(names) if !block && method_defined?(:perform, false)
+        self.durable_identity = block || names
+      end
+
+      # This class's runs, newest first. `for(*args, **kwargs)` on the relation
+      # finds the runs `perform_later(*args, **kwargs)` would have created;
+      # `for(workflow_key: "...")` matches a key verbatim.
+      def workflow_runs = Run.where(job_class: name).newest_first
+
+      # The key `perform_later(*args, **kwargs)` builds.
+      def durable_key_for(...) = new(...).send(:durable_key) # :nodoc:
+
+      def durable_check_identity!(names) # :nodoc:
+        parameters = instance_method(:perform).parameters
+        known = parameters.filter_map { |type, name| name if %i[req opt key keyreq].include?(type) }
+        unknown = names.find { |name| !known.include?(name) } or return
+
+        signature = parameters.map do |type, name|
+          case type
+          when :req then name.to_s
+          when :opt then "#{name} = ..."
+          when :rest then "*#{name}"
+          when :keyreq then "#{name}:"
+          when :key then "#{name}: ..."
+          when :keyrest then "**#{name}"
+          when :block then "&#{name}"
+          end
+        end.join(", ")
+        raise ArgumentError, "identified_by: unknown perform parameter #{unknown.inspect} (perform(#{signature}) has #{known.join(", ")})"
+      end
     end
 
     # Creates the run before the job is handed to the adapter, so that the row is
     # part of the caller's transaction when enqueuing is deferred to after commit.
-    # A retry or resume (same +job_id+) finds the row and only updates its status.
+    # A retry or resume (same `job_id`) finds the row and only updates its status.
     def enqueue(options = {})
       durable_run_enqueued!
       super
@@ -99,10 +127,7 @@ module ActiveJob
       super
     end
 
-    # The payload references the run instead of carrying progress and attributes.
-    # +durable_run_id+ is +nil+ for a job serialized before any row exists (built
-    # but never enqueued, or bulk-enqueued): such a job starts fresh and its row is
-    # created when it performs.
+    # The run must be the only source of truth, so drop the base continuation parameters from the payload.
     def serialize # :nodoc:
       super.except("continuation", "attributes", "resumptions").merge("durable_run_id" => @durable_run&.id)
     end
@@ -112,34 +137,25 @@ module ActiveJob
       @durable_run_id = job_data["durable_run_id"]
     end
 
-    # A run is +discarded+ when Active Job swallowed the error and +failed+ when the
-    # error is raised to the backend; a retried job is +enqueued+ again by +enqueue+.
+    # A run is `discarded` when Active Job swallowed the error and `failed` when the
+    # error is raised to the backend; a retried job is `enqueued` again by `enqueue`.
     def perform_now # :nodoc:
       @durable_discarded_error = nil
       result = super
       durable_run_discarded!(@durable_discarded_error) if @durable_discarded_error
       result
-    rescue Exception => error # rubocop:disable Lint/RescueException -- same as ActiveJob::Execution#perform_now; re-raised
-      durable_run_failed!(error)
+    rescue Exception => err # rubocop:disable Lint/RescueException
+      durable_run_failed!(err)
       raise
     end
 
     private
 
-    # Continuable builds the Continuation here rather than in +deserialize+, so
-    # that a cursor that fails to deserialize raises inside +perform_now+ where the
-    # job's error handlers run. The row is read at the same point for the same
-    # reason: a missing row raises RunNotFoundError there. Without a run id (see
-    # +serialize+) Continuable's own payload handling is left alone.
     def deserialize_arguments_if_needed
       super
       durable_restore_from_run! if @durable_run_id
     end
 
-    # Rebuilds what Continuable and Attributes used to read from the payload: the
-    # +{"completed" => [...], "current" => [name, serialized_cursor]}+ shape from the
-    # run and its current step attempt, the attribute values from +state+, and
-    # +resumptions+.
     def durable_restore_from_run!
       run_id, @durable_run_id = @durable_run_id, nil
       run = Run.find_by(id: run_id, active_job_id: job_id)
@@ -163,56 +179,41 @@ module ActiveJob
       progress
     end
 
-    # Step rows hold the cursor in Active Job argument form. Since Rails 8.2
-    # (rails/rails#58045) Continuation deserializes the current cursor itself;
-    # 8.1 expects the plain value.
     def durable_cursor_for_continuation(serialized_cursor)
       if Continuation.private_method_defined?(:serialized_current)
-        serialized_cursor
+        serialized_cursor # Rails 8.2+
       else
-        Arguments.deserialize([serialized_cursor]).first
+        Arguments.deserialize([serialized_cursor]).first # Rails <8.2
       end
     end
 
-    # Rails 8.1's +continue+ calls +resume_job(exception: e)+ on the error-resume
-    # path, which lands in the positional parameter as +{exception: e}+; main
-    # passes the exception positionally (rails/rails@aa159a7e). The argument goes
-    # to +super+ unchanged.
     def resume_job(exception) # :nodoc:
       @durable_resumed = true
       error = exception.is_a?(Hash) ? exception[:exception] : exception
       if error.is_a?(Continuation::Interrupt)
-        durable_step_finished!("interrupted")
+        durable_step_finished!("interrupted") # Rails 8.2+
       else
-        durable_step_finished!("failed", error: error)
+        durable_step_finished!("failed", error:) # Rails <8.2
       end
-      durable_write_run(state: durable_state, resumptions: resumptions, last_heartbeat_at: Time.current)
+      durable_write_run(state: durable_state, resumptions:, last_heartbeat_at: Time.current)
       super
     end
 
-    # Wraps Continuable's +continue+: a normal return is a completed run unless
-    # +resume_job+ ran; an error escaping +continue+ closes the open step row and is
-    # left to +perform_now+, which knows whether Active Job handles it.
+    # Wraps Continuable's `continue`.
     def durable_perform
       @durable_step = nil
       @durable_resumed = false
       durable_run_started!
       yield
       durable_run_completed! unless @durable_resumed
-    rescue Exception => error # rubocop:disable Lint/RescueException -- re-raised
-      durable_step_finished!("failed", error: error)
+    rescue Exception => error # rubocop:disable Lint/RescueException
+      durable_step_finished!("failed", error:)
       raise
     end
 
-    # Run row
+    def durable_run = @durable_run ||= Run.find_by(active_job_id: job_id)
 
-    def durable_run
-      @durable_run ||= Run.find_by(active_job_id: job_id)
-    end
-
-    # Writes +attributes+ to the run found by +active_job_id+, or creates the run with
-    # them. The unique index is the arbiter of a concurrent first insert: the loser
-    # finds the winner's row and writes to it.
+    # Last write wins.
     def durable_upsert_run!(**attributes)
       if durable_run
         durable_write_run(**attributes)
@@ -240,11 +241,7 @@ module ActiveJob
       run
     end
 
-    # Also called by +retry_job+ (+retry_on+, +resume_job+): the attribute values
-    # must be in the row before the adapter serializes the job.
-    def durable_run_enqueued!
-      durable_upsert_run!(status: "enqueued", state: durable_state, finished_at: nil, transitioned_at: Time.current)
-    end
+    def durable_run_enqueued! = durable_upsert_run!(status: "enqueued", state: durable_state, finished_at: nil, transitioned_at: Time.current)
 
     def durable_run_started!
       now = Time.current
@@ -264,7 +261,7 @@ module ActiveJob
         current_step: nil,
         active_key: nil,
         state: durable_state,
-        resumptions: resumptions,
+        resumptions:,
         finished_at: now,
         transitioned_at: now
       )
@@ -276,7 +273,7 @@ module ActiveJob
         status: "failed",
         active_key: nil,
         state: durable_state,
-        resumptions: resumptions,
+        resumptions:,
         error_class: error.class.name,
         error_message: error.message,
         finished_at: now,
@@ -305,21 +302,18 @@ module ActiveJob
       durable_run.update_columns(**attributes, updated_at: Time.current)
     end
 
-    # Step rows
-
     def durable_step_started!(step, isolated)
       run = durable_run or return
       now = Time.current
       name = step.name.to_s
 
-      @durable_step = Step.create!(
-        run: run,
-        name: name,
+      @durable_step = run.steps.create(
+        name:,
         position: continuation.instrumentation[:completed_steps].size + 1,
-        attempt: Step.where(run_id: run.id, name: name).maximum(:attempt).to_i + 1,
+        attempt: Step.where(run_id: run.id, name:).maximum(:attempt).to_i + 1,
         status: "started",
         cursor: durable_serialize_cursor(step.cursor),
-        isolated: isolated,
+        isolated:,
         started_at: now
       )
       durable_write_run(current_step: name)
@@ -332,17 +326,16 @@ module ActiveJob
 
       step_row.update_columns(status: "completed", cursor: durable_serialize_cursor(step.cursor), finished_at: now)
       completed_steps = continuation.instrumentation[:completed_steps].map(&:to_s) << step.name.to_s
-      durable_write_run(completed_steps: completed_steps, current_step: nil, state: durable_state, last_heartbeat_at: now)
+      durable_write_run(completed_steps:, current_step: nil, state: durable_state, last_heartbeat_at: now)
     end
 
-    # Closes the open step row, if any, as +interrupted+ or +failed+ with its last cursor.
     def durable_step_finished!(status, error: nil)
       step_row = @durable_step or return
       @durable_step = nil
       current = continuation.instrumentation[:current_step]
 
       step_row.update_columns(
-        status: status,
+        status:,
         cursor: current ? durable_serialize_cursor(current.cursor) : step_row.cursor,
         error_class: error&.class&.name,
         error_message: error&.message,
@@ -350,9 +343,6 @@ module ActiveJob
       )
     end
 
-    # Called from Continuable's +checkpoint!+ before it decides whether to interrupt:
-    # the step row gets the cursor; the run row gets the attribute values when they
-    # changed and a heartbeat when the previous one is older than HEARTBEAT_INTERVAL.
     def durable_checkpoint!
       return unless durable_run
 
@@ -370,34 +360,64 @@ module ActiveJob
       durable_write_run(**attributes) if attributes.any?
     end
 
-    # Values
+    # The attribute values as `ActiveJob::Attributes#serialize` puts them under
+    # `"attributes"`. Rails 8.1 has no Attributes.
+    def durable_state = respond_to?(:serialize_attribute_values, true) ? serialize_attribute_values : {}
 
-    # The attribute values in the form ActiveJob::Attributes#serialize puts under
-    # +"attributes"+. Rails 8.1 has Continuable without Attributes: empty then.
-    def durable_state
-      respond_to?(:serialize_attribute_values, true) ? serialize_attribute_values : {}
-    end
+    def durable_serialize_cursor(cursor) = Arguments.serialize([cursor]).first
 
-    def durable_serialize_cursor(cursor)
-      Arguments.serialize([cursor]).first
-    end
+    def durable_resumptions = continuation.started? ? resumptions + 1 : resumptions
 
-    # Continuable increments +resumptions+ inside +continue+, which runs inside
-    # this module's callback; this is the value the execution is about to have.
-    def durable_resumptions
-      continuation.started? ? resumptions + 1 : resumptions
-    end
-
-    # Default identity: the GlobalID-able arguments as +collection/id+, joined with
-    # +:+ ("cards/42:users/7"); a SHA256 of the serialized arguments otherwise.
+    # The run's identity inside the class: the `identified_by` components (or every
+    # argument) rendered and joined with ":".
     def durable_key
-      serialized = serialize_arguments_if_needed(arguments)
-      records = arguments_serialized? ? [] : arguments.grep(GlobalID::Identification)
-
-      if records.any?
-        records.map { |record| "#{durable_collection_name(record)}/#{record.id}" }.join(":")
+      components = arguments_serialized? ? [] : durable_identity_components
+      if components.empty?
+        Digest::SHA256.hexdigest(ActiveSupport::JSON.encode(serialize_arguments_if_needed(arguments)))
       else
-        Digest::SHA256.hexdigest(ActiveSupport::JSON.encode(serialized))
+        components.map { |component| durable_key_component(component) }.join(":")
+      end
+    end
+
+    def durable_identity_components
+      positional, keywords = durable_split_arguments
+      identity = durable_identity
+
+      if identity.is_a?(Proc)
+        value = identity.call(*positional, **keywords)
+        value.is_a?(Array) ? value : [value]
+      elsif identity.present?
+        self.class.durable_check_identity!(identity)
+        identity.map { |name| durable_named_component(name, positional, keywords) }
+      else
+        positional + keywords.sort_by { |name, _| name.to_s }.map { |name, value| "#{name}=#{durable_key_component(value)}" }
+      end
+    end
+
+    def durable_named_component(name, positional, keywords)
+      parameters = self.class.instance_method(:perform).parameters
+      positional_names = parameters.filter_map { |type, parameter| parameter if type == :req || type == :opt }
+
+      if (index = positional_names.index(name))
+        positional[index]
+      else
+        keywords[name]
+      end
+    end
+
+    # Active Job stores keyword arguments as a trailing ruby2_keywords hash.
+    def durable_split_arguments
+      positional = arguments.dup
+      keywords = (positional.last.is_a?(Hash) && Hash.ruby2_keywords_hash?(positional.last)) ? positional.pop : {}
+      [positional, keywords.transform_keys(&:to_sym)]
+    end
+
+    def durable_key_component(value)
+      case value
+      when GlobalID::Identification then "#{durable_collection_name(value)}/#{value.id}"
+      when Symbol, String, Integer, Float, true, false then value.to_s
+      when nil then ""
+      else Digest::SHA256.hexdigest(ActiveSupport::JSON.encode(Arguments.serialize([value])))[0, 16]
       end
     end
 
@@ -409,8 +429,6 @@ module ActiveJob
       end
     end
 
-    # The method form of +step+, resolved with Continuable's rules (0 or 1
-    # positional argument, no keywords), so that the body can be wrapped.
     def durable_step_method(step_name)
       step_method = method(step_name)
 

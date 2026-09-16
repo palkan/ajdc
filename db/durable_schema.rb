@@ -16,8 +16,7 @@ ActiveRecord::Schema[8.1].define(version: 1) do
     t.string "current_step"
     t.json "completed_steps", null: false
     t.json "state", null: false
-    t.datetime "waiting_until"
-    t.datetime "timeout_at"
+    t.datetime "wake_at"
     t.json "pending_signals", null: false
     t.json "parked_job"
     t.integer "resumptions", default: 0, null: false
@@ -34,7 +33,7 @@ ActiveRecord::Schema[8.1].define(version: 1) do
     t.index ["job_class", "key"], name: "index_active_job_durable_runs_on_key"
     t.index ["active_job_id"], name: "index_active_job_durable_runs_on_active_job_id", unique: true
     t.index ["status"], name: "index_active_job_durable_runs_on_status"
-    t.index ["waiting_until"], name: "index_active_job_durable_runs_on_waiting_until"
+    t.index ["status", "wake_at"], name: "index_active_job_durable_runs_on_status_and_wake_at"
     t.index ["status", "transitioned_at"], name: "index_active_job_durable_runs_on_status_and_transitioned_at"
   end
 

@@ -3,21 +3,26 @@
 module ActiveJob
   module Durable
     # One row per run of a durable job: from the first enqueue to a terminal status,
-    # across every retry, interrupt and resume. Found by +active_job_id+.
+    # across every retry, interrupt and resume.
     class Run < Record
-      # The +state+ column keeps the attribute values in Active Job argument form
-      # (the form +ActiveJob::Attributes+ restores from), while +Run#state+ reads as
-      # a plain hash: <tt>{"verdict" => "unsure"}</tt>. Writes accept either form.
+      LIVE_STATUSES = %w[enqueued running waiting awaiting].freeze
+      ATTENTION_STATUSES = %w[failed halted].freeze
+      TERMINAL_STATUSES = %w[completed discarded cancelled].freeze
+      STATUSES = (LIVE_STATUSES + ATTENTION_STATUSES + TERMINAL_STATUSES).freeze
+
+      # The `state` column keeps the attribute values in Active Job argument form
+      # (the form `ActiveJob::Attributes` restores from), while `Run#state` reads as
+      # a plain hash: `{"verdict" => "unsure"}`. Writes accept either form.
       class StateType < ActiveRecord::Type::Json
         def deserialize(value)
           decoded = super
           decoded.present? ? ActiveJob::Arguments.deserialize([decoded]).first : {}
         end
 
-        def serialize(value)
-          super(self.class.serialized(value))
-        end
+        def serialize(value) = super(self.class.serialized(value))
 
+        # The argument form of `value`; an already-serialized hash (marked with
+        # `_aj_` keys) is returned as is.
         def self.serialized(value)
           value = value.to_h
           if value.each_key.any? { |key| key.to_s.start_with?("_aj_") }
@@ -30,15 +35,39 @@ module ActiveJob
 
       self.table_name = "active_job_durable_runs"
 
-      has_many :steps, class_name: "ActiveJob::Durable::Step", dependent: :delete_all
+      has_many :steps, -> { order(:position, :attempt) }, class_name: "ActiveJob::Durable::Step", dependent: :delete_all
 
       attribute :completed_steps, default: -> { [] }
       attribute :state, StateType.new, default: -> { {} }
       attribute :pending_signals, default: -> { {} }
 
-      def serialized_state # :nodoc:
-        StateType.serialized(state)
-      end
+      scope :newest_first, -> { order(created_at: :desc, id: :desc) }
+      scope :live, -> { where(status: LIVE_STATUSES) }
+      scope :attention, -> { where(status: ATTENTION_STATUSES) }
+      scope :terminal, -> { where(status: TERMINAL_STATUSES) }
+      STATUSES.each { |status| scope status, -> { where(status:) } }
+
+      scope :at_step, ->(name) { where(current_step: name.to_s) }
+      scope :stuck_for, ->(duration) {
+        since = duration.ago
+        where(status: "running").where(last_heartbeat_at: ...since)
+          .or(where(status: %w[enqueued waiting awaiting]).where(transitioned_at: ...since))
+      }
+      scope :for, ->(*args, **kwargs) {
+        next where(key: kwargs[:workflow_key]) if kwargs.key?(:workflow_key)
+
+        job_class = where_values_hash["job_class"] or raise ArgumentError, "for needs a job class; use MyJob.workflow_runs.for(...)"
+        where(key: job_class.constantize.durable_key_for(*args, **kwargs))
+      }
+
+      def live? = LIVE_STATUSES.include?(status)
+
+      def attention? = ATTENTION_STATUSES.include?(status)
+
+      def terminal? = TERMINAL_STATUSES.include?(status)
+
+      # The attribute values in the form the job restores them from.
+      def serialized_state = StateType.serialized(state)
     end
   end
 end

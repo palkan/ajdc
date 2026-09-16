@@ -63,6 +63,8 @@ class ActiveJob::StepLifecycleTest < ActiveSupport::TestCase
   class TaggedCardJob < ActiveJob::Base # rubocop:disable Rails/ApplicationJob
     include ActiveJob::Durable
 
+    identified_by :card
+
     def perform(card, tag)
       step(:one) {}
     end

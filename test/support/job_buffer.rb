@@ -2,21 +2,13 @@
 
 module JobBuffer
   class << self
-    def clear
-      values.clear
-    end
+    def clear = values.clear
 
-    def add(value)
-      values << value
-    end
+    def add(value) = values << value
 
-    def values
-      @values ||= []
-    end
+    def values = @values ||= []
 
-    def last_value
-      values.last
-    end
+    def last_value = values.last
   end
 end
 
