@@ -31,3 +31,34 @@ AllCops:
 
 Style/FrozenStringLiteralComment:
   Enabled: true
+
+Lint/ConstantDefinitionInBlock:
+  Exclude:
+    - test/**/*.rb
+
+Lint/UselessTimes:
+   Exclude:
+    - test/**/*.rb
+
+Standard:
+  Exclude:
+    - test/cases/continuation_test.rb
+    - test/cases/attributes_test.rb
+
+Rails:
+  Exclude:
+    - test/cases/continuation_test.rb
+    - test/cases/attributes_test.rb
+
+Style:
+  Exclude:
+    - test/cases/continuation_test.rb
+    - test/cases/attributes_test.rb
+
+Layout:
+  Exclude:
+    - test/cases/continuation_test.rb
+    - test/cases/attributes_test.rb
+
+Rails/TimeZone:
+  Enabled: false

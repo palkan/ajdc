@@ -1,33 +1,29 @@
 [![Gem Version](https://badge.fury.io/rb/ajdc.svg)](https://rubygems.org/gems/ajdc)
 [![Build](https://github.com/palkan/ajdc/workflows/Build/badge.svg)](https://github.com/palkan/ajdc/actions)
 
-# AJDC: Active Job Durable Continuation
+# AJ/DC: Active Job Durable Continuation
 
-TBD
+AJ/DC brings durability to Active Job Continuable jobs:
+
+- Runs, steps, cursors are stored in the database and **survive crashes**, not only restarts
+- **Unique runs** associated with Active Record models or user-provided workflows IDs
+- **Timers**, sleeps and waits for jobs
+- Human-in-the-loop and other **signals** support
 
 ## Installation
 
-Adding to a gem:
-
-```ruby
-# my-cool-gem.gemspec
-Gem::Specification.new do |spec|
-  # ...
-  spec.add_dependency "ajdc"
-  # ...
-end
-```
-
-Or adding to your project:
+Add to your project's Gemfile:
 
 ```ruby
 # Gemfile
 gem "ajdc"
 ```
 
-### Supported Ruby versions
+### Requirements
 
 - Ruby (MRI) >= 3.3
+- Rails >= 8.1
+- SQLite / PostgreSQL / MySQL
 
 ## Usage
 

@@ -7,22 +7,32 @@ end
 
 $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 ENV["RAILS_ENV"] = "test"
-
-require "combustion"
-require "ajdc"
+ENV["TARGET_DB"] ||= "sqlite"
 
 begin
-  # See https://github.com/pat/combustion
-  Combustion.initialize! :active_record, :active_job do
-    config.logger = Logger.new(nil)
-    config.log_level = :fatal
-  end
+  require_relative "../test/dummy/config/environment"
+  ActiveRecord::Migrator.migrations_paths = [File.expand_path("../test/dummy/db/migrate", __dir__)]
 rescue => e
   # Fail fast if application couldn't be loaded
   $stdout.puts "Failed to load the app: #{e.message}\n#{e.backtrace.take(5).join("\n")}"
   exit(1)
 end
 
+def rails_version_is(range, &)
+  if range.cover?(ActiveJob::VERSION::STRING)
+    block_given? ? yield : true
+  else
+    false
+  end
+end
+
 Dir["#{__dir__}/support/**/*.rb"].sort.each { |f| require f }
 
 require "minitest/autorun"
+
+class ActiveSupport::TestCase
+  def before_setup
+    ActiveJob::Base.queue_adapter.perform_enqueued_jobs = true
+    ActiveJob::Base.queue_adapter.perform_enqueued_at_jobs = true
+  end
+end

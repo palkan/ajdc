@@ -32,9 +32,14 @@ Gem::Specification.new do |s|
   # s.metadata["hyperdrive_targets"] = "railties"
   # s.metadata["hyperdrive_artifacts"] = "skill"
   # s.files += Dir.glob("skills/**/*") + %w[hyperdrive.yml]
+  rails_version = ">= 8.1"
+  s.add_dependency "activerecord", rails_version
+  s.add_dependency "activejob", rails_version
+  s.add_dependency "railties", rails_version
 
-  s.add_development_dependency "bundler", ">= 4.0"
-  s.add_development_dependency "combustion", ">= 1.1"
+  s.add_development_dependency "sqlite3", ">= 2.0"
+
+  s.add_development_dependency "bundler", ">= 2.0"
   s.add_development_dependency "rake", ">= 13.0"
   s.add_development_dependency "minitest", "~> 6.0"
 end

@@ -5,41 +5,52 @@ on:
     branches:
     - master
   pull_request:
-
 jobs:
-  rspec:
+  test:
     runs-on: ubuntu-latest
     env:
       BUNDLE_JOBS: 4
       BUNDLE_RETRY: 3
-      
       BUNDLE_GEMFILE: ${{ matrix.gemfile }}
-      
+      TARGET_DB: ${{ matrix.database }}
+      RAILS_ENV: test
       CI: true
     strategy:
       fail-fast: false
       matrix:
-        
         ruby: ["4.0"]
-        gemfile: ["gemfiles/rails8.gemfile"]
+        gemfile: ["gemfiles/rails82.gemfile"]
+        database: [sqlite, mysql, postgres]
         include:
         - ruby: "4.0"
           gemfile: "gemfiles/railsmain.gemfile"
+          database: sqlite
         - ruby: "3.4"
-          gemfile: "gemfiles/rails80.gemfile"
-        - ruby: "3.2"
-          gemfile: "gemfiles/rails7.gemfile"
-        
+          gemfile: "gemfiles/rails81.gemfile"
+          database: sqlite
+        - ruby: "3.3"
+          gemfile: "gemfiles/rails81.gemfile"
+          database: sqlite
+    services:
+      mysql:
+        image: mysql:8.0.31
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports:
+          - 33066:3306
+        options: --health-cmd "mysql -h localhost -e \"select now()\"" --health-interval 1s --health-timeout 5s --health-retries 30
+      postgres:
+        image: postgres:15.1
+        env:
+          POSTGRES_HOST_AUTH_METHOD: "trust"
+        ports:
+          - 55432:5432
     steps:
     - uses: actions/checkout@v6
     - uses: ruby/setup-ruby@v1
       with:
         ruby-version: ${{ matrix.ruby }}
         bundler-cache: true
-    
-    
     - name: Run tests
       run: |
         bundle exec rake test
-    
-

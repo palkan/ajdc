@@ -1,0 +1,51 @@
+# MySQL. Version 8.0 and up is required
+#   gem install mysql2
+#
+#   Ensure the MySQL 2 gem is defined in your Gemfile
+#   gem "mysql2"
+#
+
+<% def database_name_from(name); ENV["TARGET_DB"]=="sqlite" ? "db/#{name}.sqlite3" : name; end %>
+
+<% if ENV["TARGET_DB"] == "sqlite" %>
+default: &default
+  adapter: sqlite3
+  pool: 50
+  timeout: 5000
+
+<% elsif ENV["TARGET_DB"] == "postgres" %>
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  username: postgres
+  pool: 20
+  host: "127.0.0.1"
+  port: 55432
+  gssencmode: disable # https://github.com/ged/ruby-pg/issues/311
+
+<% else %>
+default: &default
+  adapter: mysql2
+  username: root
+  pool: 20
+  host: "127.0.0.1"
+  port: 33066
+<% end %>
+
+development:
+  primary:
+    <<: *default
+    database: <%= database_name_from("development") %>
+  queue:
+    <<: *default
+    database: <%= database_name_from("development_queue") %>
+    migrations_paths: db/queue_migrate
+
+test:
+  primary:
+    <<: *default
+    database: <%= database_name_from("test") %>
+  queue:
+    <<: *default
+    database: <%= database_name_from("test_queue") %>
+    migrations_paths: db/queue_migrate
