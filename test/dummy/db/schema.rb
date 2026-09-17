@@ -8,4 +8,12 @@ ActiveRecord::Schema[8.1].define(version: 1) do
     t.string "verdict"
     t.timestamps
   end
+
+  create_table "chats", force: :cascade do |t|
+    t.integer "turns", default: 0, null: false
+    t.integer "turn_limit", null: false
+    t.integer "approval_turn"
+    t.boolean "approved", default: false, null: false
+    t.timestamps
+  end
 end

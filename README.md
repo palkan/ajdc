@@ -156,6 +156,67 @@ MyJob.workflow_runs.stuck_for(1.hour)
 MyJob.workflow_runs.newest_first
 ```
 
+### Halting
+
+Halting allows you to pause the execution on an error that could be resolved by a human (or alike), so the run could be restarted later from the current step/cursor (e.g., a plan out of storage, a file to fix by hand). Use `halt_on` or `halt!` to stop the run but keep it resumeable (unlike `discard_on`):
+
+```ruby
+class ImportJob < ApplicationJob
+  include ActiveJob::Durable
+
+  discard_on ZipFile::InvalidFileError
+  halt_on InsufficientStorageSpaceError
+
+  def perform(import)
+    step :check
+    step :process
+  end
+end
+```
+
+The run's status is `halted`; `error_class` and `error_message` hold the error, `current_step` names the step and its row keeps the cursor.
+
+`halt!(reason)` does the same from inside a step, without an error; the reason lands in `halt_reason`:
+
+```ruby
+step :run do |step|
+  until chat.complete?
+    chat.step
+    halt!(:tool_approval) if chat.awaiting_approval?
+    step.checkpoint!
+  end
+end
+```
+
+```ruby
+ImportJob.workflow_runs.halted.first.halt_reason  # => "tool_approval"
+```
+
+### Step callbacks
+
+`before_step`, `after_step` and `around_step` are Active Job callbacks, like `before_perform` and friends, for every step that runs; a step skipped on resume triggers none. `after_step` runs only when the step completes. `current_step` is the running `ActiveJob::Continuation::Step`:
+
+```ruby
+class Cable::DiagnosticJob < ApplicationJob
+  include ActiveJob::Durable
+
+  after_step :broadcast_update
+  around_step { |job, block| Rails.logger.tagged(job.current_step.name, &block) }
+
+  def perform(cable)
+    @cable = cable
+    step :provider_status, isolated: true
+    step :websocket_status, isolated: true
+    step :admin_api_status, isolated: true
+  end
+
+  private
+    def broadcast_update
+      @cable.broadcast_replace(partial: "cables/diagnostic", locals: { step: current_step.name })
+    end
+end
+```
+
 ### Timers
 
 TBD

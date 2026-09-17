@@ -47,14 +47,28 @@ module ActiveJob
     # `rescue_from` handlers can see it.
     class RunNotFoundError < StandardError; end
 
+    # Raised by `halt!`
+    class Halt < Exception # rubocop:disable Lint/InheritException
+      attr_reader :reason
+
+      def initialize(reason = nil)
+        @reason = reason
+        super(reason ? "Halted (#{reason})" : "Halted")
+      end
+    end
+
     included do
       class_attribute :durable_identity, instance_writer: false
+      class_attribute :durable_halt_errors, instance_writer: false, default: []
+
+      define_callbacks :step, skip_after_callbacks_if_terminated: true
 
       # Add our hook before Continuable's `around_perform :continue`,
       # so we can wrap it
       around_perform :durable_perform, prepend: true
 
       after_discard { |_job, error| @durable_discarded_error = error }
+      rescue_from(Halt) { |error| durable_halt!(error) }
     end
 
     module ClassMethods
@@ -75,6 +89,22 @@ module ActiveJob
         durable_check_identity!(names) if !block && method_defined?(:perform, false)
         self.durable_identity = block || names
       end
+
+      # Errors that could be resolved by a human (or alike), so the run
+      # could be restarted from the current step/cursor.
+      def halt_on(*errors)
+        self.durable_halt_errors += errors
+        rescue_from(*errors) { |error| durable_halt!(error) }
+      end
+
+      # Callbacks around every step that runs (a step skipped on resume runs none),
+      # with the semantics of `before_perform` and friends; the step is `current_step`.
+      # `after_step` runs only when the step completes.
+      def before_step(*filters, &blk) = set_callback(:step, :before, *filters, &blk)
+
+      def after_step(*filters, &blk) = set_callback(:step, :after, *filters, &blk)
+
+      def around_step(*filters, &blk) = set_callback(:step, :around, *filters, &blk)
 
       # This class's runs, newest first. `for(*args, **kwargs)` on the relation
       # finds the runs `perform_later(*args, **kwargs)` would have created;
@@ -116,10 +146,25 @@ module ActiveJob
       block ||= durable_step_method(step_name)
 
       super do |step|
+        @current_step = step
         durable_step_started!(step, isolated)
-        block.call(step)
+        run_callbacks(:step) { block.call(step) }
         durable_step_completed!(step)
+      ensure
+        @current_step = nil
       end
+    end
+
+    # The `ActiveJob::Continuation::Step` that is running, `nil` between steps.
+    # (`Run#current_step` is the step's name.)
+    attr_reader :current_step
+
+    # Stops the run from inside a step: status `halted` with `halt_reason`, the
+    # step row keeps its cursor, and the job's serialized form is parked on the run.
+    def halt!(reason = nil)
+      raise ArgumentError, "halt! must be called inside a step" unless current_step
+
+      raise Halt.new(reason)
     end
 
     def checkpoint! # :nodoc:
@@ -188,8 +233,10 @@ module ActiveJob
     end
 
     def resume_job(exception) # :nodoc:
-      @durable_resumed = true
       error = exception.is_a?(Hash) ? exception[:exception] : exception
+      raise error if durable_halt?(error)
+
+      @durable_resumed = true
       if error.is_a?(Continuation::Interrupt)
         durable_step_finished!("interrupted") # Rails 8.2+
       else
@@ -201,14 +248,33 @@ module ActiveJob
 
     # Wraps Continuable's `continue`.
     def durable_perform
+      return if durable_run&.terminal? # cancelled while the job was in the queue
+
       @durable_step = nil
       @durable_resumed = false
       durable_run_started!
       yield
       durable_run_completed! unless @durable_resumed
     rescue Exception => error # rubocop:disable Lint/RescueException
-      durable_step_finished!("failed", error:)
+      durable_step_finished!("failed", error:) unless durable_halt?(error)
       raise
+    end
+
+    def durable_halt?(error) = error.is_a?(Halt) || durable_halt_errors.any? { |klass| error.is_a?(klass) }
+
+    def durable_halt!(error)
+      halt = error.is_a?(Halt)
+      durable_step_finished!("halted", error: (error unless halt))
+      durable_write_run(
+        status: "halted",
+        state: durable_state,
+        resumptions:,
+        parked_job: serialize,
+        halt_reason: (error.reason&.to_s if halt),
+        error_class: (error.class.name unless halt),
+        error_message: (error.message unless halt),
+        transitioned_at: Time.current
+      )
     end
 
     def durable_run = @durable_run ||= Run.find_by(active_job_id: job_id)
@@ -241,7 +307,11 @@ module ActiveJob
       run
     end
 
-    def durable_run_enqueued! = durable_upsert_run!(status: "enqueued", state: durable_state, finished_at: nil, transitioned_at: Time.current)
+    def durable_run_enqueued!
+      attributes = {status: "enqueued", finished_at: nil, transitioned_at: Time.current}
+      attributes[:state] = durable_state unless @durable_run_id # a job built from its payload has not read the row yet
+      durable_upsert_run!(**attributes)
+    end
 
     def durable_run_started!
       now = Time.current
@@ -250,6 +320,7 @@ module ActiveJob
         started_at: durable_run&.started_at || now,
         last_heartbeat_at: now,
         resumptions: durable_resumptions,
+        parked_job: nil,
         transitioned_at: now
       )
     end
