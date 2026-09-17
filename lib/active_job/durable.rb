@@ -38,10 +38,6 @@ module ActiveJob
 
     mattr_accessor :connects_to, instance_accessor: false
 
-    # `last_heartbeat_at` is refreshed at most once per interval; the cursor is
-    # still committed at every checkpoint.
-    HEARTBEAT_INTERVAL = 5.seconds
-
     # Raised inside `perform_now` when the payload references a run row that does
     # not exist (or belongs to another job), so `retry_on`, `discard_on` and
     # `rescue_from` handlers can see it.
@@ -51,6 +47,10 @@ module ActiveJob
     # another caller resumed it first.
     class NotResumable < StandardError; end
 
+    # Raised by `Run#cancel!` when the run is terminal, or when another caller
+    # ended it first.
+    class NotCancellable < StandardError; end
+
     # Raised by `halt!`
     class Halt < Exception # rubocop:disable Lint/InheritException
       attr_reader :reason
@@ -59,6 +59,12 @@ module ActiveJob
         @reason = reason
         super(reason ? "Halted (#{reason})" : "Halted")
       end
+    end
+
+    # Raised at a checkpoint or a step boundary when `Run#cancel!` ended the run
+    # meanwhile: the job stops, the open step row is `cancelled` and the job
+    # handles the error itself, so nothing reaches the backend.
+    class Cancelled < Exception # rubocop:disable Lint/InheritException
     end
 
     included do
@@ -73,6 +79,7 @@ module ActiveJob
 
       after_discard { |_job, error| @durable_discarded_error = error }
       rescue_from(Halt) { |error| durable_halt!(error) }
+      rescue_from(Cancelled) { durable_step_finished!("cancelled") }
     end
 
     module ClassMethods
@@ -250,7 +257,7 @@ module ActiveJob
       else
         durable_step_finished!("failed", error:) # Rails <8.2
       end
-      durable_write_run(state: durable_state, resumptions:, last_heartbeat_at: Time.current)
+      durable_write_running!(state: durable_state, resumptions:, last_heartbeat_at: Time.current)
       super
     end
 
@@ -264,7 +271,7 @@ module ActiveJob
       yield
       durable_run_completed! unless @durable_resumed
     rescue Exception => error # rubocop:disable Lint/RescueException
-      durable_step_finished!("failed", error:) unless durable_halt?(error)
+      durable_step_finished!("failed", error:) unless durable_halt?(error) || error.is_a?(Cancelled)
       raise
     end
 
@@ -274,6 +281,7 @@ module ActiveJob
       halt = error.is_a?(Halt)
       durable_step_finished!("halted", error: (error unless halt))
       durable_write_run(
+        if_status: "running",
         status: "halted",
         state: durable_state,
         resumptions:,
@@ -287,12 +295,9 @@ module ActiveJob
 
     def durable_run = @durable_run ||= Run.find_by(active_job_id: job_id)
 
-    # Last write wins.
-    def durable_upsert_run!(**attributes)
-      if durable_run
-        durable_write_run(**attributes)
-        return durable_run
-      end
+    # Last write wins, within `if_status:`.
+    def durable_upsert_run!(if_status: nil, **attributes)
+      return durable_write_run(if_status:, **attributes) if durable_run
 
       attributes = {
         job_class: self.class.name,
@@ -308,34 +313,36 @@ module ActiveJob
 
       if run.previously_new_record?
         @durable_state_written = attributes[:state]
-        @durable_heartbeat_at = attributes[:last_heartbeat_at]
+        true
       else
-        durable_write_run(**attributes)
+        durable_write_run(if_status:, **attributes)
       end
-      run
     end
 
+    # A re-enqueue of a cancelled run leaves the row alone; the queued job
+    # then performs nothing.
     def durable_run_enqueued!
       attributes = {status: "enqueued", finished_at: nil, transitioned_at: Time.current}
       attributes[:state] = durable_state unless @durable_run_id # a job built from its payload has not read the row yet
-      durable_upsert_run!(**attributes)
+      durable_upsert_run!(if_status: Run::CANCELLABLE_STATUSES, **attributes)
     end
 
     def durable_run_started!
       now = Time.current
       durable_upsert_run!(
+        if_status: Run::CANCELLABLE_STATUSES,
         status: "running",
         started_at: durable_run&.started_at || now,
         last_heartbeat_at: now,
         resumptions: durable_resumptions,
         parked_job: nil,
         transitioned_at: now
-      )
+      ) or raise Cancelled, "Run #{durable_run.id} was cancelled"
     end
 
     def durable_run_completed!
       now = Time.current
-      durable_write_run(
+      durable_write_running!(
         status: "completed",
         current_step: nil,
         active_key: nil,
@@ -349,6 +356,7 @@ module ActiveJob
     def durable_run_failed!(error)
       now = Time.current
       durable_upsert_run!(
+        if_status: Run::CANCELLABLE_STATUSES,
         status: "failed",
         active_key: nil,
         state: durable_state,
@@ -364,6 +372,7 @@ module ActiveJob
     def durable_run_discarded!(error)
       now = Time.current
       durable_upsert_run!(
+        if_status: Run::CANCELLABLE_STATUSES,
         status: "discarded",
         active_key: nil,
         error_class: error.class.name,
@@ -373,19 +382,29 @@ module ActiveJob
       )
     end
 
-    # One UPDATE, no callbacks or validations.
-    def durable_write_run(**attributes)
-      return unless durable_run
+    # One UPDATE, no callbacks or validations; the loaded row is not refreshed.
+    # `if_status:` guards the statement with the row's current status: false,
+    # and nothing written, when the run left that status meanwhile.
+    def durable_write_run(if_status: nil, **attributes)
+      run = durable_run or return true
 
       @durable_state_written = attributes[:state] if attributes.key?(:state)
-      @durable_heartbeat_at = attributes[:last_heartbeat_at] if attributes.key?(:last_heartbeat_at)
-      durable_run.update_columns(**attributes, updated_at: Time.current)
+      scope = Run.where(id: run.id)
+      scope = scope.where(status: if_status) if if_status
+      scope.update_all(**attributes, updated_at: Time.current).positive?
     end
 
+    # The only way a `running` run changes status from outside is `Run#cancel!`.
+    def durable_write_running!(**attributes)
+      durable_write_run(if_status: "running", **attributes) or raise Cancelled, "Run #{durable_run.id} was cancelled"
+    end
+
+    # The guarded run write comes first, so a cancelled run gets no row for a
+    # step that never started.
     def durable_step_started!(step, isolated)
       run = durable_run or return
-      now = Time.current
       name = step.name.to_s
+      durable_write_running!(current_step: name)
 
       @durable_step = run.steps.create(
         name:,
@@ -394,19 +413,20 @@ module ActiveJob
         status: "started",
         cursor: durable_serialize_cursor(step.cursor),
         isolated:,
-        started_at: now
+        started_at: Time.current
       )
-      durable_write_run(current_step: name)
     end
 
+    # The guarded run write comes first: a step whose completion the cancelled
+    # run did not record is closed as `cancelled`, like one stopped mid-way.
     def durable_step_completed!(step)
       step_row = @durable_step or return
-      @durable_step = nil
       now = Time.current
-
-      step_row.update_columns(status: "completed", cursor: durable_serialize_cursor(step.cursor), finished_at: now)
       completed_steps = continuation.instrumentation[:completed_steps].map(&:to_s) << step.name.to_s
-      durable_write_run(completed_steps:, current_step: nil, state: durable_state, last_heartbeat_at: now)
+      durable_write_running!(completed_steps:, current_step: nil, state: durable_state, last_heartbeat_at: now)
+
+      @durable_step = nil
+      step_row.update_columns(status: "completed", cursor: durable_serialize_cursor(step.cursor), finished_at: now)
     end
 
     def durable_step_finished!(status, error: nil)
@@ -423,21 +443,19 @@ module ActiveJob
       )
     end
 
+    # The cursor is committed first, so a cancelled step keeps it; the guarded
+    # heartbeat write is what detects the cancel.
     def durable_checkpoint!
       return unless durable_run
 
-      now = Time.current
       if @durable_step && (current = continuation.instrumentation[:current_step])
         @durable_step.update_columns(cursor: durable_serialize_cursor(current.cursor))
       end
 
-      attributes = {}
+      attributes = {last_heartbeat_at: Time.current}
       state = durable_state
       attributes[:state] = state unless state == @durable_state_written
-      if @durable_heartbeat_at.nil? || @durable_heartbeat_at <= now - HEARTBEAT_INTERVAL
-        attributes[:last_heartbeat_at] = now
-      end
-      durable_write_run(**attributes) if attributes.any?
+      durable_write_running!(**attributes)
     end
 
     # The attribute values as `ActiveJob::Attributes#serialize` puts them under

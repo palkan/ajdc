@@ -200,6 +200,14 @@ A halted (or failed) run is resumed in place: `resume!` puts the job back in the
 ImportJob.workflow_runs.halted.first.resume!
 ```
 
+### Cancelling
+
+`cancel!` ends a run that is not terminal: the row becomes `cancelled` and the queue is left alone. A queued job for a cancelled run performs nothing; a running job stops at its next checkpoint or step boundary, and the open step row is `cancelled` with its cursor. A terminal run raises `ActiveJob::Durable::NotCancellable`.
+
+```ruby
+ImportJob.workflow_runs.for(import).live.sole.cancel!
+```
+
 ### Step callbacks
 
 `before_step`, `after_step` and `around_step` are Active Job callbacks, like `before_perform` and friends, for every step that runs; a step skipped on resume triggers none. `after_step` runs only when the step completes. `current_step` is the running `ActiveJob::Continuation::Step`:

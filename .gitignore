@@ -47,3 +47,4 @@ tmp/
 
 gemfiles/*.lock
 
+*.local.md

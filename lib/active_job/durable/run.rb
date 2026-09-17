@@ -9,6 +9,7 @@ module ActiveJob
       ATTENTION_STATUSES = %w[failed halted].freeze
       TERMINAL_STATUSES = %w[completed discarded cancelled].freeze
       STATUSES = (LIVE_STATUSES + ATTENTION_STATUSES + TERMINAL_STATUSES).freeze
+      CANCELLABLE_STATUSES = (LIVE_STATUSES + ATTENTION_STATUSES).freeze
 
       # The `state` column keeps the attribute values in Active Job argument form
       # (the form `ActiveJob::Attributes` restores from), while `Run#state` reads as
@@ -77,6 +78,20 @@ module ActiveJob
         reenqueue_parked_job!(from: ATTENTION_STATUSES) ||
           raise(NotResumable, "Run #{id} is #{reload.status}; only a halted or failed run can be resumed")
         self
+      end
+
+      # Ends a run that is not terminal, in one status-guarded update, and returns
+      # it reloaded. Never touches the queue: a queued job for a cancelled run
+      # performs nothing, a running one stops at its next checkpoint. Raises
+      # `NotCancellable` for a terminal run, or when another caller ended it first.
+      def cancel!
+        now = Time.current
+        updated = self.class.where(id:, status: CANCELLABLE_STATUSES).update_all(
+          status: "cancelled", active_key: nil, parked_job: nil, finished_at: now, transitioned_at: now, updated_at: now
+        )
+        raise NotCancellable, "Run #{id} is #{reload.status}; a terminal run cannot be cancelled" if updated.zero?
+
+        reload
       end
 
       private
