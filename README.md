@@ -156,6 +156,8 @@ MyJob.workflow_runs.stuck_for(1.hour)
 MyJob.workflow_runs.newest_first
 ```
 
+A run's `status` says where the job is. `enqueued`: the job is in the queue, written at the first enqueue and at every re-enqueue (an isolated step, a graceful-stop interrupt, a resume after an error, a `retry_on` retry). `running`: a worker is executing it. `started_at` is set once, at the first execution, so an `enqueued` run with no `started_at` never ran. `stuck_for` reads `enqueued` runs by `transitioned_at` and `running` runs by `last_heartbeat_at`.
+
 ### Halting
 
 Halting allows you to pause the execution on an error that could be resolved by a human (or alike), so the run could be restarted later from the current step/cursor (e.g., a plan out of storage, a file to fix by hand). Use `halt_on` or `halt!` to stop the run but keep it resumeable (unlike `discard_on`):
@@ -190,6 +192,12 @@ end
 
 ```ruby
 ImportJob.workflow_runs.halted.first.halt_reason  # => "tool_approval"
+```
+
+A halted (or failed) run is resumed in place: `resume!` puts the job back in the queue, the step that stopped re-runs from its cursor as a new attempt, and the earlier attempts keep their errors. Any other status raises `ActiveJob::Durable::NotResumable`.
+
+```ruby
+ImportJob.workflow_runs.halted.first.resume!
 ```
 
 ### Step callbacks

@@ -68,6 +68,36 @@ module ActiveJob
 
       # The attribute values in the form the job restores them from.
       def serialized_state = StateType.serialized(state)
+
+      # Puts a `halted` or `failed` run back in the queue, in place: the step that
+      # stopped re-runs from its cursor as a new attempt, and the step rows keep
+      # the earlier attempts with their errors. Raises `NotResumable` for any
+      # other status, or when another caller resumed the run first.
+      def resume!
+        reenqueue_parked_job!(from: ATTENTION_STATUSES) ||
+          raise(NotResumable, "Run #{id} is #{reload.status}; only a halted or failed run can be resumed")
+        self
+      end
+
+      private
+
+      # One status-guarded transition to `enqueued`, then the parked job goes
+      # back to the queue once every open transaction has committed. False when
+      # the status was not in `from` any more (a concurrent resume, a cancel).
+      def reenqueue_parked_job!(from:, **changes)
+        now = Time.current
+        updated = self.class.where(id:, status: from).update_all(
+          status: "enqueued", error_class: nil, error_message: nil, halt_reason: nil,
+          finished_at: nil, transitioned_at: now, updated_at: now, **changes
+        )
+        return false if updated.zero?
+
+        reload
+        job = ActiveJob::Base.deserialize(parked_job)
+        job.scheduled_at = nil # a retry's or a resume's delay does not carry over
+        ActiveRecord.after_all_transactions_commit { job.enqueue }
+        true
+      end
     end
   end
 end

@@ -47,6 +47,10 @@ module ActiveJob
     # `rescue_from` handlers can see it.
     class RunNotFoundError < StandardError; end
 
+    # Raised by `Run#resume!` when the run is not `halted` or `failed`, or when
+    # another caller resumed it first.
+    class NotResumable < StandardError; end
+
     # Raised by `halt!`
     class Halt < Exception # rubocop:disable Lint/InheritException
       attr_reader :reason
@@ -210,6 +214,10 @@ module ActiveJob
       @durable_state_written = run.serialized_state
       self.resumptions = run.resumptions
       self.continuation = Continuation.new(self, durable_serialized_progress(run))
+      # A run that starts from its parked job was re-enqueued by `resume!` (or by
+      # the backend), not by Continuation, so it is not one of its resumptions;
+      # `continue` still adds one when the run has progress, so start one below.
+      self.resumptions -= 1 if run.parked_job.present? && continuation.started?
       if run.state.present? && respond_to?(:deserialize_attribute_values, true)
         deserialize_attribute_values(run.serialized_state)
       end
@@ -345,6 +353,7 @@ module ActiveJob
         active_key: nil,
         state: durable_state,
         resumptions:,
+        parked_job: serialize,
         error_class: error.class.name,
         error_message: error.message,
         finished_at: now,
