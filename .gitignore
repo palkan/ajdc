@@ -48,3 +48,5 @@ tmp/
 gemfiles/*.lock
 
 *.local.md
+
+vendor/

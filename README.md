@@ -147,6 +147,13 @@ identified_by { |import, **kwargs| [import, kwargs.fetch(:format, "csv")] }   # 
 
 A name that is not a `perform` parameter raises `ArgumentError`: at the declaration when the class already defines `perform`, otherwise at the first `perform_later`.
 
+`set(workflow_key:)` names one run's key verbatim, whatever the class derives. It is an enqueue option like `wait:` or `queue:`, so it works with `perform_later`, `perform_now` and `perform_all_later`:
+
+```ruby
+ImportJob.set(workflow_key: "imports/42/retry-3", queue: "low").perform_later(import)
+ImportJob.workflow_runs.for(workflow_key: "imports/42/retry-3")
+```
+
 Other usefule scopes:
 
 ```ruby

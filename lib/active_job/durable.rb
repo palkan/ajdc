@@ -149,7 +149,14 @@ module ActiveJob
     # part of the caller's transaction when enqueuing is deferred to after commit.
     # A retry or resume (same `job_id`) finds the row and only updates its status.
     def enqueue(options = {})
+      @durable_workflow_key = options[:workflow_key]&.to_s
       durable_run_enqueued!
+      super
+    end
+
+    # Supports `set(workflow_key: "...")`to provide an explicit workflow (not run) identifier.
+    def set(options = {}) # :nodoc:
+      @durable_workflow_key = options[:workflow_key]&.to_s
       super
     end
 
@@ -183,14 +190,19 @@ module ActiveJob
       super
     end
 
-    # The run must be the only source of truth, so drop the base continuation parameters from the payload.
+    # The run must be the only source of truth, so drop the base continuation
+    # parameters from the payload. A workflow key travels only until the row
+    # exists (`perform_all_later` creates it at the first execution).
     def serialize # :nodoc:
-      super.except("continuation", "attributes", "resumptions").merge("durable_run_id" => @durable_run&.id)
+      payload = super.except("continuation", "attributes", "resumptions").merge("durable_run_id" => @durable_run&.id)
+      payload["durable_workflow_key"] = @durable_workflow_key if @durable_workflow_key && !@durable_run
+      payload
     end
 
     def deserialize(job_data) # :nodoc:
       super
       @durable_run_id = job_data["durable_run_id"]
+      @durable_workflow_key = job_data["durable_workflow_key"]
     end
 
     # A run is `discarded` when Active Job swallowed the error and `failed` when the
@@ -466,9 +478,11 @@ module ActiveJob
 
     def durable_resumptions = continuation.started? ? resumptions + 1 : resumptions
 
-    # The run's identity inside the class: the `identified_by` components (or every
-    # argument) rendered and joined with ":".
+    # The run's identity inside the class: `set(workflow_key:)` verbatim, else the
+    # `identified_by` components (or every argument) rendered and joined with ":".
     def durable_key
+      return @durable_workflow_key if @durable_workflow_key
+
       components = arguments_serialized? ? [] : durable_identity_components
       if components.empty?
         Digest::SHA256.hexdigest(ActiveSupport::JSON.encode(serialize_arguments_if_needed(arguments)))

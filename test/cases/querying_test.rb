@@ -177,6 +177,29 @@ class ActiveJob::QueryingTest < ActiveSupport::TestCase
     assert_equal 0, CardJob.workflow_runs.for(workflow_key: "x").count
   end
 
+  test "set(workflow_key:) is the key verbatim, over any derivation" do
+    IdentifiedCardJob.set(workflow_key: "card-42-v2", queue: "low").perform_later(@card)
+    IdentifiedCardJob.perform_later(@card)
+
+    assert_equal ["cards/#{@card.id}", "card-42-v2"], IdentifiedCardJob.workflow_runs.pluck(:key)
+    assert_equal "low", queue_adapter.enqueued_jobs.first["queue_name"]
+    assert_equal 1, IdentifiedCardJob.workflow_runs.for(@card).count
+    assert_not queue_adapter.enqueued_jobs.first.key?("durable_workflow_key")
+  end
+
+  test "set(workflow_key:) reaches perform_now and a bulk-enqueued job" do
+    CardJob.set(workflow_key: "now").perform_now(@card)
+    assert_equal "now", Run.sole.key
+
+    ActiveJob.perform_all_later([CardJob.new(@card).set(workflow_key: "bulk")])
+    assert_equal 1, Run.count
+    assert_equal "bulk", queue_adapter.enqueued_jobs.sole["durable_workflow_key"]
+
+    perform_enqueued_jobs
+    assert_equal %w[bulk now], Run.order(:key).pluck(:key)
+    assert_equal "completed", Run.find_by!(key: "bulk").status
+  end
+
   test "status scopes group the statuses" do
     statuses = %w[enqueued running waiting awaiting completed failed halted discarded cancelled]
     statuses.each { |status| create_run(status:) }
