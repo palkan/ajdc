@@ -273,7 +273,38 @@ end
 
 ### Timers
 
-TBD
+A workflow run can _go to sleep_ (=pause) and _wake up_ (=resume) eaither at specific time (`wait_until`) or after a given time interval passed (`wait`). Example:
+
+```ruby
+class License::LifecycleJob < ApplicationJob
+  include ActiveJob::Durable
+
+  unique_by :license, on_conflict: :replace
+
+  def perform(license)
+    step :remind, wait_until: license.expires_at - 2.weeks
+    step :expire, wait_until: license.expires_at
+    step :revoke, wait: 2.weeks
+  end
+
+  # ...
+end
+```
+
+When the workflow reaches the waiting step, it's status is changed to `waiting`, and it's no longer present in the job queue. To wake sleeping workflows up, you need to run a single recurring job, `ActiveJob::Durable::WakeJob`. For example, with Solid Queue:
+
+```yaml
+# config/recurring.yml
+durable_wake:
+  class: ActiveJob::Durable::WakeJob
+  schedule: every minute
+```
+
+You can also wake up the workflow manually by using the `#wake_up` method:
+
+```ruby
+License::LifecycleJob.workflow_runs.for(license).waiting.sole.wake_up   # send the reminder now
+```
 
 ### Signals
 

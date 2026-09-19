@@ -10,6 +10,7 @@ module ActiveJob
       TERMINAL_STATUSES = %w[completed discarded cancelled].freeze
       STATUSES = (LIVE_STATUSES + ATTENTION_STATUSES + TERMINAL_STATUSES).freeze
       CANCELLABLE_STATUSES = (LIVE_STATUSES + ATTENTION_STATUSES).freeze
+      WAKEABLE_STATUSES = %w[waiting awaiting].freeze
 
       # The `state` column keeps the attribute values in Active Job argument form
       # (the form `ActiveJob::Attributes` restores from), while `Run#state` reads as
@@ -49,17 +50,24 @@ module ActiveJob
       STATUSES.each { |status| scope status, -> { where(status:) } }
 
       scope :at_step, ->(name) { where(current_step: name.to_s) }
+      # A parked run is stuck when its wake time passed and the clock did not wake it.
       scope :stuck_for, ->(duration) {
         since = duration.ago
         where(status: "running").where(last_heartbeat_at: ...since)
-          .or(where(status: %w[enqueued waiting awaiting]).where(transitioned_at: ...since))
+          .or(where(status: "enqueued").where(transitioned_at: ...since))
+          .or(where(status: WAKEABLE_STATUSES).where(wake_at: ...since))
       }
+      scope :due, ->(now = Time.current) { where(status: WAKEABLE_STATUSES, wake_at: ..now) }
       scope :for, ->(*args, **kwargs) {
         next where(key: kwargs[:workflow_key]) if kwargs.key?(:workflow_key)
 
         job_class = where_values_hash["job_class"] or raise ArgumentError, "for needs a job class; use MyJob.workflow_runs.for(...)"
         where(key: job_class.constantize.durable_key_for(*args, **kwargs))
       }
+
+      def self.wake_due(now = Time.current)
+        due(now).find_each.count { |run| run.reenqueue_parked_job!(from: WAKEABLE_STATUSES, wake_at: nil) }
+      end
 
       def live? = LIVE_STATUSES.include?(status)
 
@@ -94,12 +102,17 @@ module ActiveJob
         reload
       end
 
-      private
+      def wake_up
+        reload
+        reenqueue_parked_job!(from: "waiting", wake_at: nil, pending_signals: pending_signals.merge(current_step => nil)) ||
+          raise(NotWaiting, "Run #{id} is #{reload.status}; only a waiting run can be woken up")
+        self
+      end
 
       # One status-guarded transition to `enqueued`, then the parked job goes
       # back to the queue once every open transaction has committed. False when
       # the status was not in `from` any more (a concurrent resume, a cancel).
-      def reenqueue_parked_job!(from:, **changes)
+      def reenqueue_parked_job!(from:, **changes) # :nodoc:
         now = Time.current
         updated = self.class.where(id:, status: from).update_all(
           status: "enqueued", error_class: nil, error_message: nil, halt_reason: nil,

@@ -9,6 +9,12 @@ ActiveRecord::Schema[8.1].define(version: 1) do
     t.timestamps
   end
 
+  create_table "licenses", force: :cascade do |t|
+    t.string "state", default: "active", null: false
+    t.datetime "expires_at", null: false
+    t.timestamps
+  end
+
   create_table "chats", force: :cascade do |t|
     t.integer "turns", default: 0, null: false
     t.integer "turn_limit", null: false
