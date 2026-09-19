@@ -51,6 +51,17 @@ module ActiveJob
     # ended it first.
     class NotCancellable < StandardError; end
 
+    # Raised by `unique_by ..., on_conflict: :reject` when a run with the same
+    # `active_key` is live or needs attention; `run` is that run.
+    class RunAlreadyExists < StandardError
+      attr_reader :run
+
+      def initialize(run)
+        @run = run
+        super("Run #{run.id} for #{run.job_class} (#{run.active_key}) is #{run.status}")
+      end
+    end
+
     # Raised by `halt!`
     class Halt < Exception # rubocop:disable Lint/InheritException
       attr_reader :reason
@@ -67,8 +78,12 @@ module ActiveJob
     class Cancelled < Exception # rubocop:disable Lint/InheritException
     end
 
+    ON_CONFLICT = %i[skip reject replace].freeze
+
     included do
       class_attribute :durable_identity, instance_writer: false
+      class_attribute :durable_uniqueness, instance_writer: false
+      class_attribute :durable_on_conflict, instance_writer: false, default: :skip
       class_attribute :durable_halt_errors, instance_writer: false, default: []
 
       define_callbacks :step, skip_after_callbacks_if_terminated: true
@@ -97,8 +112,27 @@ module ActiveJob
       # Without a declaration every argument is a component: positional in order,
       # then keywords sorted by name as `name=value`.
       def identified_by(*names, &block)
-        durable_check_identity!(names) if !block && method_defined?(:perform, false)
+        durable_check_identity!(:identified_by, names) if !block && method_defined?(:perform, false)
         self.durable_identity = block || names
+      end
+
+      # Specicy the run uniqueness components in the same forms as `identified_by`.
+      # Uniqueness is only enforced for runs that hasn't been terminated:  either _live_ runs
+      # (with "enqueued", "running", "waiting", "awaiting" status) or _paused_ runs ("failed" or "halted").
+      # The `on_conflict:` option defines what to do if the mathing run exists:
+      #
+      #   unique_by :import                         # :skip — enqueue nothing, `perform_later` returns false
+      #   unique_by :payout, on_conflict: :reject   # raise `RunAlreadyExists`
+      #   unique_by :license, on_conflict: :replace # cancel that run and start this one
+      #
+      def unique_by(*names, on_conflict: :skip, &block)
+        unless ON_CONFLICT.include?(on_conflict)
+          raise ArgumentError, "unique_by: on_conflict must be one of #{ON_CONFLICT.map(&:inspect).join(", ")}, got #{on_conflict.inspect}"
+        end
+
+        durable_check_identity!(:unique_by, names) if !block && method_defined?(:perform, false)
+        self.durable_uniqueness = block || names
+        self.durable_on_conflict = on_conflict
       end
 
       # Errors that could be resolved by a human (or alike), so the run
@@ -125,7 +159,7 @@ module ActiveJob
       # The key `perform_later(*args, **kwargs)` builds.
       def durable_key_for(...) = new(...).send(:durable_key) # :nodoc:
 
-      def durable_check_identity!(names) # :nodoc:
+      def durable_check_identity!(macro, names) # :nodoc:
         parameters = instance_method(:perform).parameters
         known = parameters.filter_map { |type, name| name if %i[req opt key keyreq].include?(type) }
         unknown = names.find { |name| !known.include?(name) } or return
@@ -141,7 +175,7 @@ module ActiveJob
           when :block then "&#{name}"
           end
         end.join(", ")
-        raise ArgumentError, "identified_by: unknown perform parameter #{unknown.inspect} (perform(#{signature}) has #{known.join(", ")})"
+        raise ArgumentError, "#{macro}: unknown perform parameter #{unknown.inspect} (perform(#{signature}) has #{known.join(", ")})"
       end
     end
 
@@ -151,6 +185,8 @@ module ActiveJob
     def enqueue(options = {})
       @durable_workflow_key = options[:workflow_key]&.to_s
       durable_run_enqueued!
+      return false if @durable_conflict # `on_conflict: :skip`: nothing to enqueue
+
       super
     end
 
@@ -213,7 +249,7 @@ module ActiveJob
       durable_run_discarded!(@durable_discarded_error) if @durable_discarded_error
       result
     rescue Exception => err # rubocop:disable Lint/RescueException
-      durable_run_failed!(err)
+      durable_run_failed!(err) unless @durable_conflict
       raise
     end
 
@@ -279,7 +315,7 @@ module ActiveJob
 
       @durable_step = nil
       @durable_resumed = false
-      durable_run_started!
+      durable_run_started! or return # a bulk-enqueued job whose key another run holds
       yield
       durable_run_completed! unless @durable_resumed
     rescue Exception => error # rubocop:disable Lint/RescueException
@@ -307,20 +343,20 @@ module ActiveJob
 
     def durable_run = @durable_run ||= Run.find_by(active_job_id: job_id)
 
-    # Last write wins, within `if_status:`.
+    # Last write wins, within `if_status:`. False, and nothing written, when the
+    # row was not created because another run holds the key (`on_conflict: :skip`).
     def durable_upsert_run!(if_status: nil, **attributes)
       return durable_write_run(if_status:, **attributes) if durable_run
 
       attributes = {
         job_class: self.class.name,
         key: durable_key,
+        active_key: (durable_active_key if durable_uniqueness),
         arguments: serialize_arguments_if_needed(arguments),
         state: durable_state,
         transitioned_at: Time.current
       }.merge(attributes)
-      run = Run.create_or_find_by!(active_job_id: job_id) do |new_run|
-        new_run.assign_attributes(attributes)
-      end
+      run = durable_create_run(attributes) or return false
       @durable_run = run
 
       if run.previously_new_record?
@@ -328,6 +364,42 @@ module ActiveJob
         true
       else
         durable_write_run(if_status:, **attributes)
+      end
+    end
+
+    # Inserts the row; finds it instead when this job is already recorded (two
+    # executions of one job). With `unique_by`, a run holding the same
+    # `active_key` decides first, by `on_conflict`; the unique index settles a
+    # race between two first enqueues, and the loser looks again, once.
+    def durable_create_run(attributes, retried: false)
+      Run.transaction(requires_new: true) do
+        if durable_uniqueness && (live = durable_live_run(attributes[:active_key]))
+          durable_resolve_conflict!(live) or next
+        end
+        Run.create!(active_job_id: job_id, **attributes)
+      end
+    rescue ActiveRecord::RecordNotUnique
+      Run.find_by(active_job_id: job_id) || (retried ? raise : durable_create_run(attributes, retried: true))
+    end
+
+    def durable_live_run(active_key) = Run.find_by(job_class: self.class.name, active_key:)
+
+    # True when this run may be inserted.
+    def durable_resolve_conflict!(live)
+      case durable_on_conflict
+      when :skip
+        @durable_conflict = live
+        false
+      when :reject
+        @durable_conflict = live
+        raise RunAlreadyExists.new(live)
+      when :replace
+        begin
+          live.cancel!
+        rescue NotCancellable
+          # ended meanwhile: its key is free
+        end
+        true
       end
     end
 
@@ -341,7 +413,7 @@ module ActiveJob
 
     def durable_run_started!
       now = Time.current
-      durable_upsert_run!(
+      written = durable_upsert_run!(
         if_status: Run::CANCELLABLE_STATUSES,
         status: "running",
         started_at: durable_run&.started_at || now,
@@ -349,7 +421,10 @@ module ActiveJob
         resumptions: durable_resumptions,
         parked_job: nil,
         transitioned_at: now
-      ) or raise Cancelled, "Run #{durable_run.id} was cancelled"
+      )
+      return false if @durable_conflict
+
+      written or raise Cancelled, "Run #{durable_run.id} was cancelled"
     end
 
     def durable_run_completed!
@@ -370,7 +445,6 @@ module ActiveJob
       durable_upsert_run!(
         if_status: Run::CANCELLABLE_STATUSES,
         status: "failed",
-        active_key: nil,
         state: durable_state,
         resumptions:,
         parked_job: serialize,
@@ -483,7 +557,19 @@ module ActiveJob
     def durable_key
       return @durable_workflow_key if @durable_workflow_key
 
-      components = arguments_serialized? ? [] : durable_identity_components
+      if durable_identity || !durable_uniqueness
+        durable_render_key(durable_identity, :identified_by)
+      else
+        durable_render_key(durable_uniqueness, :unique_by)
+      end
+    end
+
+    # The identity one run holds at a time: `set(workflow_key:)` verbatim, else
+    # the `unique_by` components.
+    def durable_active_key = @durable_workflow_key || durable_render_key(durable_uniqueness, :unique_by)
+
+    def durable_render_key(identity, macro)
+      components = arguments_serialized? ? [] : durable_identity_components(identity, macro)
       if components.empty?
         Digest::SHA256.hexdigest(ActiveSupport::JSON.encode(serialize_arguments_if_needed(arguments)))
       else
@@ -491,15 +577,14 @@ module ActiveJob
       end
     end
 
-    def durable_identity_components
+    def durable_identity_components(identity, macro)
       positional, keywords = durable_split_arguments
-      identity = durable_identity
 
       if identity.is_a?(Proc)
         value = identity.call(*positional, **keywords)
         value.is_a?(Array) ? value : [value]
       elsif identity.present?
-        self.class.durable_check_identity!(identity)
+        self.class.durable_check_identity!(macro, identity)
         identity.map { |name| durable_named_component(name, positional, keywords) }
       else
         positional + keywords.sort_by { |name, _| name.to_s }.map { |name, value| "#{name}=#{durable_key_component(value)}" }

@@ -100,7 +100,38 @@ run.steps.map(&:name) # => ["validate", "process"]
 
 ### Uniqueness
 
-TBD
+Durable state allows you to enforce wofkflow runs uniqueness. For that, use the `unique_by` macro in the workflow and specify the `perform` parameters that identify a run. Uniqueness is only enforced for runs that hasn't been terminated: either _live_ runs (with "enqueued", "running", "waiting", "awaiting" status) or _paused_ runs ("failed" or "halted"). Here is an example:
+
+```ruby
+class ImportJob < ApplicationJob
+  include ActiveJob::Durable
+
+  unique_by :import
+
+  def perform(import)
+    step :check
+    step :process
+  end
+end
+
+ImportJob.perform_later(import)   # => the job
+ImportJob.perform_later(import)   # => false, nothing enqueued
+```
+
+You can provide and option `on_conflict` parameter to specify what to do in case of the uniqueness conflict:
+
+- `:skip` (default) enqueues nothing; `perform_later` returns `false`.
+- `:reject` raises `ActiveJob::Durable::RunAlreadyExists` (the currnent run is available as `error.run`).
+- `:replace` cancels the current run and starts the new one. A renewal or a reschedule is `perform_later` again:
+
+```ruby
+class License::LifecycleJob < ApplicationJob
+  include ActiveJob::Durable
+
+  unique_by :license, on_conflict: :replace
+  # ...
+end
+```
 
 ### Reading runs
 
