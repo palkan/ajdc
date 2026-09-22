@@ -31,4 +31,9 @@ rescue LoadError
   task("rubocop:md") {}
 end
 
+begin
+  require "hyperdrive/skill_tasks"
+rescue LoadError
+end
+
 task default: %w[rubocop test]

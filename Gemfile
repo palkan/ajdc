@@ -4,6 +4,8 @@ source "https://rubygems.org"
 
 gem "debug", platform: :mri unless ENV["CI"] == "true"
 
+gem "rails-hyperdrive", require: false
+
 gem "sqlite3"
 
 gemspec

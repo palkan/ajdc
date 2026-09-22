@@ -19,21 +19,40 @@ gem "ajdc"
 
 or run `bundle add ajdc`.
 
-Then generate the two tables AJ/DC writes to (`active_job_durable_runs`, `active_job_durable_steps`):
+### Addinng agent skills
+
+The gem ships a skill for coding agents in `skills/ajdc`. It follows the [skills.sh](https://www.skills.sh) layout, so it works with any agent that reads `SKILL.md`.
+
+With [Rails Hyperdrive](https://github.com/rails-hyperdrive/rails-hyperdrive) it installs itself: `bin/rails hyperdrive:init` the first time, then `bundle add ajdc` or `bin/rails hyperdrive:sync` lands it in `.claude/skills/ajdc`.
+
+Without it, install straight from the repository with the [skills.sh](https://www.skills.sh) CLI, or copy `skills/ajdc` into your agent's skills directory:
+
+```sh
+npx skills add palkan/ajdc
+```
+
+Now, you can ask your agent to continue the installation or do it yourself.
+
+### Preparing the database
+
+AJ/DC keeps its data in two tables (`active_job_durable_runs`, `active_job_durable_steps`). Generate the migration and run it:
 
 ```sh
 bin/rails generate ajdc:install
+bin/rails db:migrate
 ```
 
-This creates a migration and a schema file; apply whichever fits your setup and delete the other:
+To keep the tables in a separate database (the Solid Queue way), declare it in `config/database.yml` with its own `migrations_paths`, then pass its name; the migration lands in that path and an initializer points AJ/DC at the database:
 
-- **Single database.** Run the generated migration with `bin/rails db:migrate` and delete `db/durable_schema.rb`.
-- **Separate database.** Add a `durable` database to `config/database.yml` with `migrations_paths: db/durable_migrate`, point AJ/DC at it, run `bin/rails db:prepare`, and delete the generated migration:
+```sh
+bin/rails generate ajdc:install --database=durable
+bin/rails db:prepare
+```
 
-  ```ruby
-  # config/initializers/active_job_durable.rb
-  ActiveJob::Durable.connects_to = { database: { writing: :durable } }
-  ```
+```ruby
+# config/initializers/active_job_durable.rb (generated)
+ActiveJob::Durable.connects_to = { database: { writing: :durable } }
+```
 
 ### Requirements
 

@@ -17,21 +17,17 @@ Gem::Specification.new do |s|
     "documentation_uri" => "https://github.com/palkan/ajdc",
     "homepage_uri" => "https://github.com/palkan/ajdc",
     "source_code_uri" => "https://github.com/palkan/ajdc",
-    "rubygems_mfa_required" => "true"
+    "rubygems_mfa_required" => "true",
+    "hyperdrive_targets" => "activejob",
+    "hyperdrive_artifacts" => "skill"
   }
 
   s.license = "MIT"
 
-  s.files = Dir.glob("lib/**/*") + Dir.glob("db/**/*") + %w[README.md LICENSE.txt CHANGELOG.md]
+  s.files = Dir.glob("lib/**/*") + Dir.glob("db/**/*") + Dir.glob("skills/**/*") + %w[README.md LICENSE.txt CHANGELOG.md]
   s.require_paths = ["lib"]
   s.required_ruby_version = ">= 3.3"
 
-  # Uncomment to make skills (skills/<name>/SKILL.md, gated via hyperdrive.yml)
-  # discoverable by Rails Hyperdrive (https://github.com/rails-hyperdrive/rails-hyperdrive).
-  # Targets are the gems that make the skills relevant to an app ("*" for any app).
-  # s.metadata["hyperdrive_targets"] = "railties"
-  # s.metadata["hyperdrive_artifacts"] = "skill"
-  # s.files += Dir.glob("skills/**/*") + %w[hyperdrive.yml]
   rails_version = ">= 8.1"
   s.add_dependency "activerecord", rails_version
   s.add_dependency "activejob", rails_version

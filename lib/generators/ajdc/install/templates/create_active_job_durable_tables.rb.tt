@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # Tables for ActiveJob::Durable: one row per run, one row per step attempt.
-# Same definition as db/durable_schema.rb, for single-database applications.
+# The gem's own test suite loads the same definition from db/durable_schema.rb.
 class CreateActiveJobDurableTables < ActiveRecord::Migration[<%= ActiveRecord::Migration.current_version %>]
   def change
     create_table :active_job_durable_runs, if_not_exists: true do |t|

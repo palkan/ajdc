@@ -1,24 +1,19 @@
 Description:
-    Installs the two tables ActiveJob::Durable writes to
-    (active_job_durable_runs and active_job_durable_steps). Two files are
-    generated; apply the one that fits the application's database setup:
+    Creates the migration for the two tables ActiveJob::Durable writes to
+    (active_job_durable_runs and active_job_durable_steps).
 
-    Single database (the tables live next to the application's tables):
-        run the generated migration, bin/rails db:migrate, and delete
-        db/durable_schema.rb.
+    Without options the migration goes to db/migrate: the tables live next to
+    the application's tables, and a run is created in the same transaction as
+    the record that starts it.
 
-    Separate database: add a "durable" database to config/database.yml with
-    "migrations_paths: db/durable_migrate", point the record class at it,
-
-        # config/initializers/active_job_durable.rb
-        ActiveJob::Durable.connects_to = { database: { writing: :durable } }
-
-    run bin/rails db:prepare (which loads db/durable_schema.rb), and delete
-    the generated migration.
+    With --database=NAME the migration goes to that database's migrations_paths
+    (from config/database.yml) and an initializer points ActiveJob::Durable at
+    it. Declare the database first, or follow the printed instructions.
 
 Example:
     bin/rails generate ajdc:install
-
-    This will create:
-        db/durable_schema.rb
         db/migrate/TIMESTAMP_create_active_job_durable_tables.rb
+
+    bin/rails generate ajdc:install --database=durable
+        db/durable_migrate/TIMESTAMP_create_active_job_durable_tables.rb
+        config/initializers/active_job_durable.rb
