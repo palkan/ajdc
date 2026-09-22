@@ -119,9 +119,9 @@ class ActiveJob::TimersTest < ActiveSupport::TestCase
     assert_enqueued_jobs 0
 
     travel 1.day
-    WakeJob.perform_now
+    ActiveJob::Durable.wake_up_due
     assert_equal "enqueued", run.reload.status
-    assert_nil run.wake_at
+    assert_equal @now + 16.days, run.wake_at # kept until the step starts
     assert_equal "remind", run.current_step
     assert_enqueued_jobs 1
 
@@ -136,8 +136,7 @@ class ActiveJob::TimersTest < ActiveSupport::TestCase
     assert_equal 0, run.resumptions
 
     travel 14.days
-    WakeJob.perform_now
-    perform_enqueued_jobs
+    perform_enqueued_jobs { ActiveJob::Durable.wake_up_due }
     run.reload
     assert_equal "expired", @license.reload.state
     assert_equal "waiting", run.status
@@ -146,8 +145,7 @@ class ActiveJob::TimersTest < ActiveSupport::TestCase
     assert_equal @now + 44.days, run.wake_at
 
     travel 14.days
-    WakeJob.perform_now
-    perform_enqueued_jobs
+    perform_enqueued_jobs { ActiveJob::Durable.wake_up_due }
     run.reload
     assert_equal "completed", run.status
     assert_equal "revoked", @license.reload.state
@@ -162,8 +160,7 @@ class ActiveJob::TimersTest < ActiveSupport::TestCase
 
   test "a target in the past runs the step at once" do
     @license.update!(expires_at: @now - 1.day)
-    LicenseLifecycleJob.perform_later(@license)
-    perform_enqueued_jobs
+    perform_enqueued_jobs { LicenseLifecycleJob.perform_later(@license) }
 
     run = Run.sole
     assert_equal ["remind:#{@license.id}", "expire:#{@license.id}"], JobBuffer.values
@@ -173,15 +170,13 @@ class ActiveJob::TimersTest < ActiveSupport::TestCase
   end
 
   test "a moved wait_until: target re-arms on wake" do
-    LicenseLifecycleJob.perform_later(@license)
-    perform_enqueued_jobs
+    perform_enqueued_jobs { LicenseLifecycleJob.perform_later(@license) }
     run = Run.sole
     assert_equal @now + 16.days, run.wake_at
 
     travel 16.days
     @license.update!(expires_at: @license.expires_at + 1.week) # renewed before the clock ticked
-    assert_equal 1, Run.wake_due
-    perform_enqueued_jobs
+    perform_enqueued_jobs { assert_equal 1, ActiveJob::Durable.wake_up_due }
     run.reload
 
     assert_equal [], JobBuffer.values
@@ -192,21 +187,19 @@ class ActiveJob::TimersTest < ActiveSupport::TestCase
     assert_equal 0, run.resumptions
 
     travel 7.days
-    WakeJob.perform_now
-    perform_enqueued_jobs
+    perform_enqueued_jobs { ActiveJob::Durable.wake_up_due }
     assert_equal ["remind:#{@license.id}"], JobBuffer.values
     assert_equal "expire", run.reload.current_step
   end
 
   test "wake_up ends the wait now" do
-    LicenseLifecycleJob.perform_later(@license)
-    perform_enqueued_jobs
+    perform_enqueued_jobs { LicenseLifecycleJob.perform_later(@license) }
     run = Run.sole
 
     assert_same run, run.wake_up
 
     assert_equal "enqueued", run.status
-    assert_nil run.wake_at
+    assert_equal @now + 16.days, run.wake_at
     assert_equal({"remind" => nil}, run.pending_signals)
     assert_equal run.id, run.parked_job["durable_run_id"]
     assert_enqueued_jobs 1
@@ -262,29 +255,29 @@ class ActiveJob::TimersTest < ActiveSupport::TestCase
 
   test "the clock wakes each due run once" do
     other = License.create!(expires_at: @now + 60.days)
-    LicenseLifecycleJob.perform_later(@license)
-    LicenseLifecycleJob.perform_later(other)
-    2.times { perform_enqueued_jobs }
+    perform_enqueued_jobs do
+      LicenseLifecycleJob.perform_later(@license)
+      LicenseLifecycleJob.perform_later(other)
+    end
     assert_equal %w[waiting waiting], Run.pluck(:status)
 
     travel 16.days
-    assert_equal 1, WakeJob.perform_now
-    assert_equal 0, WakeJob.perform_now
+    assert_equal 1, ActiveJob::Durable.wake_up_due
+    assert_equal 0, ActiveJob::Durable.wake_up_due
+    assert_equal 0, WakeJob.perform_now # the scheduled job is the same call
     assert_enqueued_jobs 1
     assert_equal [@now + 46.days], Run.due.or(Run.waiting).pluck(:wake_at)
   end
 
   test "a callable target is evaluated when the step is reached" do
-    LazyJob.perform_later(@license)
-    perform_enqueued_jobs
+    perform_enqueued_jobs { LazyJob.perform_later(@license) }
 
     run = Run.sole
     assert_equal [:one], JobBuffer.values
     assert_equal 1, LazyJob.evaluations
     assert_equal @now + 16.days, run.wake_at
 
-    run.wake_up
-    perform_enqueued_jobs
+    perform_enqueued_jobs { run.wake_up }
     run.reload
     assert_equal [:one, :remind], JobBuffer.values
     assert_equal 2, LazyJob.evaluations # the consumed wake skips the target, the next step evaluates its own
@@ -293,8 +286,7 @@ class ActiveJob::TimersTest < ActiveSupport::TestCase
   end
 
   test "a resumed step does not wait again" do
-    FlakyReminderJob.perform_later(@license)
-    perform_enqueued_jobs
+    perform_enqueued_jobs { FlakyReminderJob.perform_later(@license) }
     run = Run.sole
     assert_equal "waiting", run.status
 
@@ -319,8 +311,7 @@ class ActiveJob::TimersTest < ActiveSupport::TestCase
   end
 
   test "a parked run is stuck only once its wake time is overdue" do
-    LicenseLifecycleJob.perform_later(@license)
-    perform_enqueued_jobs
+    perform_enqueued_jobs { LicenseLifecycleJob.perform_later(@license) }
     run = Run.sole
 
     travel 15.days

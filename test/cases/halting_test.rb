@@ -149,9 +149,7 @@ class ActiveJob::HaltingTest < ActiveSupport::TestCase
 
   test "halt! parks the run with a reason and the later steps never run" do
     cable = Card.create!(title: "Cable")
-    DiagnosticJob.perform_later(cable)
-
-    2.times { perform_enqueued_jobs } # provider_status, then websocket_status in its own execution
+    perform_enqueued_jobs { DiagnosticJob.perform_later(cable) } # provider_status, then websocket_status in its own execution
 
     run = Run.sole
     assert_equal "halted", run.status

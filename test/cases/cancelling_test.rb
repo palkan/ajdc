@@ -164,8 +164,7 @@ class ActiveJob::CancellingTest < ActiveSupport::TestCase
 
   test "cancel! on a halted run ends it and resume! raises" do
     DataImportJob.failure = ["b", InsufficientStorageError]
-    DataImportJob.perform_later(@import, %w[a b c])
-    perform_enqueued_jobs
+    perform_enqueued_jobs { DataImportJob.perform_later(@import, %w[a b c]) }
     run = Run.sole
     assert_equal "halted", run.status
 
@@ -295,9 +294,7 @@ class ActiveJob::CancellingTest < ActiveSupport::TestCase
   end
 
   test "cancel! after the last step leaves the run cancelled" do
-    TailCancelJob.perform_later
-
-    assert_nothing_raised { perform_enqueued_jobs }
+    perform_enqueued_jobs { TailCancelJob.perform_later }
 
     assert_equal %i[one two], RecordingJob.ran
     run = Run.sole
@@ -308,8 +305,7 @@ class ActiveJob::CancellingTest < ActiveSupport::TestCase
 
   test "cancel! on a terminal run raises NotCancellable" do
     card = Card.create!(title: "Card", state: "ready")
-    FetchJob.perform_later(card)
-    perform_enqueued_jobs
+    perform_enqueued_jobs { FetchJob.perform_later(card) }
     completed = Run.sole
     assert_equal "completed", completed.status
 
@@ -317,8 +313,7 @@ class ActiveJob::CancellingTest < ActiveSupport::TestCase
     assert_match(/Run #{completed.id} is completed/, error.message)
 
     DataImportJob.failure = ["b", IntegrityError]
-    DataImportJob.perform_later(@import, %w[a b c])
-    perform_enqueued_jobs
+    perform_enqueued_jobs { DataImportJob.perform_later(@import, %w[a b c]) }
     discarded = Run.where.not(id: completed.id).sole
     assert_equal "discarded", discarded.status
     assert_raises(ActiveJob::Durable::NotCancellable) { discarded.cancel! }

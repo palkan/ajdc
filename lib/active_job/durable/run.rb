@@ -66,7 +66,7 @@ module ActiveJob
       }
 
       def self.wake_due(now = Time.current)
-        due(now).find_each.count { |run| run.reenqueue_parked_job!(from: WAKEABLE_STATUSES, wake_at: nil) }
+        due(now).find_each.count { |run| run.reenqueue_parked_job!(from: WAKEABLE_STATUSES) }
       end
 
       def live? = LIVE_STATUSES.include?(status)
@@ -102,10 +102,31 @@ module ActiveJob
         reload
       end
 
-      def wake_up
-        reload
-        reenqueue_parked_job!(from: "waiting", wake_at: nil, pending_signals: pending_signals.merge(current_step => nil)) ||
-          raise(NotWaiting, "Run #{id} is #{reload.status}; only a waiting run can be woken up")
+      # Delivers a signal: `value` (any JSON value, raw) under `name`. A run
+      # parked at that name goes back to the queue and the step runs with the
+      # value; any other live run keeps it in `pending_signals` for the `await`
+      # to consume when the line is reached. A second signal for the same name
+      # overwrites the first. Without a name, the parked step is the one woken:
+      # a timer ends now, an `await` receives `nil`. Raises `NotLive` when the run
+      # is not live, `NotWaiting` for a nameless wake of a run that is not parked.
+      # The row lock makes a signal and the job's own park or consume atomic.
+      def wake_up(name = nil, value = nil)
+        transaction do
+          lock!
+          unless name
+            WAKEABLE_STATUSES.include?(status) or raise NotWaiting, "Run #{id} is #{status}; only a waiting or awaiting run can be woken up"
+            name = current_step
+          end
+          live? or raise NotLive, "Run #{id} is #{status}; a signal needs a live run"
+
+          signals = pending_signals.merge(name.to_s => value)
+          if WAKEABLE_STATUSES.include?(status) && current_step == name.to_s
+            reenqueue_parked_job!(from: status, pending_signals: signals)
+          else
+            self.class.where(id:, status:).update_all(pending_signals: signals, updated_at: Time.current)
+            reload
+          end
+        end
         self
       end
 

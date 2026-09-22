@@ -102,9 +102,7 @@ class ActiveJob::UniquenessTest < ActiveSupport::TestCase
   end
 
   test "a finished run frees the key" do
-    ImportJob.perform_later(@card)
-    perform_enqueued_jobs
-    perform_enqueued_jobs
+    perform_enqueued_jobs { ImportJob.perform_later(@card) }
 
     run = Run.sole
     assert_equal "completed", run.status
@@ -115,8 +113,7 @@ class ActiveJob::UniquenessTest < ActiveSupport::TestCase
   end
 
   test "a halted run keeps the key until it is cancelled" do
-    HaltingJob.perform_later(@card)
-    perform_enqueued_jobs
+    perform_enqueued_jobs { HaltingJob.perform_later(@card) }
     halted = Run.sole
     assert_equal "halted", halted.status
     assert_equal "cards/#{@card.id}", halted.active_key

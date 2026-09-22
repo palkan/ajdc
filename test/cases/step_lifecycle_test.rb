@@ -112,9 +112,7 @@ class ActiveJob::StepLifecycleTest < ActiveSupport::TestCase
   end
 
   test "an isolated step runs in its own execution" do
-    IsolatedJob.perform_later
-
-    3.times { perform_enqueued_jobs }
+    perform_enqueued_jobs { IsolatedJob.perform_later }
 
     assert_performed_jobs 3
     assert_enqueued_jobs 0

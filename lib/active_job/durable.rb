@@ -39,6 +39,10 @@ module ActiveJob
 
     mattr_accessor :connects_to, instance_accessor: false
 
+    # Wakes every `waiting` or `awaiting` run whose `wake_at` has passed, once each, and
+    # returns how many. `WakeJob` calls it on schedule; tests call it inside `travel_to`.
+    def self.wake_up_due = Run.wake_due
+
     # Raised inside `perform_now` when the payload references a run row that does
     # not exist (or belongs to another job), so `retry_on`, `discard_on` and
     # `rescue_from` handlers can see it.
@@ -55,6 +59,10 @@ module ActiveJob
     # Raised by `Run#wake_up` when the run is not `waiting`, or when the clock
     # or another caller woke it first.
     class NotWaiting < StandardError; end
+
+    # Raised by `Run#wake_up(name, value)` when the run is not live: a signal
+    # for a run that ended, or that needs attention first, has no one to consume it.
+    class NotLive < StandardError; end
 
     # Raised by `unique_by ..., on_conflict: :reject` when a run with the same
     # `active_key` is live or needs attention; `run` is that run.
@@ -212,7 +220,7 @@ module ActiveJob
       raise ArgumentError, "Step '#{step_name}' takes wait: or wait_until:, not both" if wait && wait_until
 
       super(step_name, start:, isolated:) do |step|
-        durable_wait!(step, wait, wait_until) if (wait || wait_until) && !step.resumed?
+        durable_wait!(step, wait, wait_until) if wait || wait_until || @durable_await
         @current_step = step
         durable_step_started!(step, isolated)
         run_callbacks(:step) { block.call(step) }
@@ -220,6 +228,26 @@ module ActiveJob
       ensure
         @current_step = nil
       end
+    end
+
+    # A step that waits for a signal from outside (`Run#wake_up(name, value)`):
+    #
+    #   await :confirmation, wait: 10.minutes
+    #
+    #   def confirmation(signal) = self.confirmed = signal.presence
+    #
+    # Reaching the line parks the run as `awaiting` until the signal arrives or
+    # the deadline (`wait:` or `wait_until:`, none by default) passes; the method
+    # named after the signal, or the block, then runs as the step's body with the
+    # value, `nil` at the deadline. A signal sent before the line is reached is
+    # consumed on the spot. The step row's cursor keeps the value, so a crash in
+    # the handler replays it; a `halt!` in the handler awaits again on resume.
+    def await(name, wait: nil, wait_until: nil, &block)
+      handler = block || durable_step_method(name)
+      @durable_await = name.to_s
+      step(name, wait:, wait_until:) { handler.call(@durable_await_value) }
+    ensure
+      @durable_await = nil
     end
 
     # The `ActiveJob::Continuation::Step` that is running, `nil` between steps.
@@ -280,6 +308,7 @@ module ActiveJob
 
       @durable_run = run
       @durable_state_written = run.serialized_state
+      @durable_deadline, @durable_deadline_step = run.wake_at, run.current_step
       self.resumptions = run.resumptions
       self.continuation = Continuation.new(self, durable_serialized_progress(run))
       # A run that starts from its parked job was re-enqueued by `resume!` (or by
@@ -312,7 +341,7 @@ module ActiveJob
       raise error if durable_halt?(error)
 
       @durable_resumed = true
-      return durable_run_waiting! if @durable_wake_at
+      return if @durable_parked # the row is written; the clock or a signal re-enqueues
 
       if error.is_a?(Continuation::Interrupt)
         durable_step_finished!("interrupted") # Rails 8.2+
@@ -329,7 +358,7 @@ module ActiveJob
 
       @durable_step = nil
       @durable_resumed = false
-      @durable_wake_at = nil
+      @durable_parked = false
       durable_run_started! or return # a bulk-enqueued job whose key another run holds
       yield
       durable_run_completed! unless @durable_resumed
@@ -428,11 +457,10 @@ module ActiveJob
 
     def durable_run_started!
       now = Time.current
-      @durable_started_at = durable_run&.started_at || now
       written = durable_upsert_run!(
         if_status: Run::CANCELLABLE_STATUSES,
         status: "running",
-        started_at: @durable_started_at,
+        started_at: durable_run&.started_at || now,
         last_heartbeat_at: now,
         resumptions: durable_resumptions,
         parked_job: nil,
@@ -453,20 +481,6 @@ module ActiveJob
         resumptions:,
         finished_at: now,
         transitioned_at: now
-      )
-    end
-
-    # Parks the run on its timer: the serialized job waits on the row, the queue
-    # holds nothing, and the clock re-enqueues it once `wake_at` has passed.
-    def durable_run_waiting!
-      durable_write_running!(
-        status: "waiting",
-        current_step: continuation.instrumentation[:current_step].name.to_s,
-        wake_at: @durable_wake_at,
-        state: durable_state,
-        resumptions:,
-        parked_job: serialize,
-        transitioned_at: Time.current
       )
     end
 
@@ -516,23 +530,33 @@ module ActiveJob
     end
 
     # The guarded run write comes first, so a cancelled run gets no row for a
-    # step that never started.
+    # step that never started. A signal for this step is consumed here, under
+    # the row lock `Run#wake_up` takes, and lands in the step row's cursor.
     def durable_step_started!(step, isolated)
       run = durable_run or return
       name = step.name.to_s
-      attributes = {current_step: name}
-      attributes[:pending_signals] = run.pending_signals.except(name) if run.pending_signals.key?(name) # consumed
-      durable_write_running!(**attributes)
 
-      @durable_step = run.steps.create(
-        name:,
-        position: continuation.instrumentation[:completed_steps].size + 1,
-        attempt: Step.where(run_id: run.id, name:).maximum(:attempt).to_i + 1,
-        status: "started",
-        cursor: durable_serialize_cursor(step.cursor),
-        isolated:,
-        started_at: Time.current
-      )
+      @durable_step_await = (@durable_await == name)
+      Run.transaction do
+        signals = durable_pending_signals(lock: true)
+        attributes = {current_step: name, wake_at: nil}
+        if signals.key?(name)
+          attributes[:pending_signals] = signals.except(name)
+          @durable_await_value = signals[name] if @durable_step_await
+        end
+        durable_write_running!(**attributes)
+
+        @durable_step = run.steps.create(
+          name:,
+          position: continuation.instrumentation[:completed_steps].size + 1,
+          attempt: Step.where(run_id: run.id, name:).maximum(:attempt).to_i + 1,
+          status: "started",
+          cursor: durable_serialize_cursor(durable_step_cursor(step)),
+          isolated:,
+          started_at: Time.current
+        )
+      end
+      @durable_deadline = nil
     end
 
     # The guarded run write comes first: a step whose completion the cancelled
@@ -544,7 +568,7 @@ module ActiveJob
       durable_write_running!(completed_steps:, current_step: nil, state: durable_state, last_heartbeat_at: now)
 
       @durable_step = nil
-      step_row.update_columns(status: "completed", cursor: durable_serialize_cursor(step.cursor), finished_at: now)
+      step_row.update_columns(status: "completed", cursor: durable_serialize_cursor(durable_step_cursor(step)), finished_at: now)
     end
 
     def durable_step_finished!(status, error: nil)
@@ -554,30 +578,68 @@ module ActiveJob
 
       step_row.update_columns(
         status:,
-        cursor: current ? durable_serialize_cursor(current.cursor) : step_row.cursor,
+        cursor: current ? durable_serialize_cursor(durable_step_cursor(current)) : step_row.cursor,
         error_class: error&.class&.name,
         error_message: error&.message,
         finished_at: Time.current
       )
     end
 
+    # Parks the run when the step's signal has not arrived and its deadline has
+    # not passed: the row is written under the row lock (so a signal sent
+    # meanwhile finds it `awaiting` and wakes it), then the job is interrupted
+    # and `resume_job` leaves it to the clock or to `Run#wake_up`. A resumed
+    # step does not wait again, except an `await` whose handler halted.
     def durable_wait!(step, wait, wait_until)
-      run = durable_run or return
-      return if run.pending_signals.key?(step.name.to_s)
+      durable_run or return
+      name = step.name.to_s
+      await = @durable_await == name
+      resumed = step.resumed? && !(await && durable_halted?(name))
+      @durable_await_value = (step.cursor if resumed) if await
+      return if resumed
 
-      wake_at = wait_until ? durable_timer_value(wait_until) : durable_wait_anchor + durable_timer_value(wait)
-      return if wake_at <= Time.current
+      status = Run.transaction do
+        next if durable_pending_signals(lock: true).key?(name)
 
-      @durable_wake_at = wake_at
-      interrupt!(reason: :waiting)
+        deadline = durable_deadline(name, wait, wait_until)
+        next if deadline && deadline <= Time.current
+
+        parked = await ? "awaiting" : "waiting"
+        durable_write_running!(
+          status: parked, current_step: name, wake_at: deadline, state: durable_state, resumptions:,
+          parked_job: serialize, transitioned_at: Time.current
+        )
+        @durable_deadline, @durable_deadline_step = deadline, name
+        parked
+      end
+      return unless status
+
+      @durable_parked = true
+      interrupt!(reason: status.to_sym)
+    end
+
+    # A `wait_until:` is read again at every wake; a `wait:` counts from the
+    # first time the line is reached and is then kept on the row.
+    def durable_deadline(name, wait, wait_until)
+      if wait_until
+        durable_timer_value(wait_until)
+      elsif wait
+        (@durable_deadline if @durable_deadline_step == name) || Time.current + durable_timer_value(wait)
+      end
     end
 
     def durable_timer_value(value) = value.respond_to?(:call) ? value.call : value
 
-    def durable_wait_anchor
-      previous = continuation.instrumentation[:completed_steps].last
-      (previous && Step.where(run_id: durable_run.id, name: previous.to_s).maximum(:finished_at)) || @durable_started_at
+    def durable_halted?(name) = Step.where(run_id: durable_run.id, name:).order(attempt: :desc).pick(:status) == "halted"
+
+    def durable_pending_signals(lock: false)
+      scope = Run.where(id: durable_run.id)
+      scope = scope.lock if lock
+      scope.pick(:pending_signals) || {}
     end
+
+    # An `await` step's cursor is the signal value, whatever the resumed step carries.
+    def durable_step_cursor(step) = @durable_step_await ? @durable_await_value : step.cursor
 
     # The cursor is committed first, so a cancelled step keeps it; the guarded
     # heartbeat write is what detects the cancel.
@@ -585,7 +647,7 @@ module ActiveJob
       return unless durable_run
 
       if @durable_step && (current = continuation.instrumentation[:current_step])
-        @durable_step.update_columns(cursor: durable_serialize_cursor(current.cursor))
+        @durable_step.update_columns(cursor: durable_serialize_cursor(durable_step_cursor(current)))
       end
 
       attributes = {last_heartbeat_at: Time.current}

@@ -80,8 +80,7 @@ class ActiveJob::DurableStateTest < ActiveSupport::TestCase
   end
 
   test "performing completes the run, its steps and its state" do
-    CardGenerationJob.perform_later(@card)
-    perform_enqueued_jobs
+    perform_enqueued_jobs { CardGenerationJob.perform_later(@card) }
 
     run = Run.sole
     assert_equal "completed", run.status

@@ -300,7 +300,15 @@ durable_wake:
   schedule: every minute
 ```
 
-You can also wake up the workflow manually by using the `#wake_up` method:
+The job is one call to `ActiveJob::Durable.wake_up_due`, which wakes every due run once and returns how many. In tests, call it yourself inside `travel_to`:
+
+```ruby
+travel_to license.expires_at - 2.weeks do
+  perform_enqueued_jobs { ActiveJob::Durable.wake_up_due }
+end
+```
+
+You can also wake up a single workflow manually by using the `#wake_up` method:
 
 ```ruby
 License::LifecycleJob.workflow_runs.for(license).waiting.sole.wake_up   # send the reminder now
@@ -308,7 +316,44 @@ License::LifecycleJob.workflow_runs.for(license).waiting.sole.wake_up   # send t
 
 ### Signals
 
-TBD
+The durable job can sleep indifinitely waiting for an external signal to wake it up. For that, you can use the `#await` method. It defines a step with no body but a _signal handler_ instead:
+
+```ruby
+class BulkImportJob < ApplicationJob
+  include ActiveJob::Durable
+
+  attribute :confirmed, :boolean, default: false
+
+  def perform(import)
+    await :confirmation, wait: 10.minutes
+    return import.destroy! unless confirmed
+
+    step :apply do
+      BulkImportService.new.call(import)
+    end
+  end
+
+  private
+    def confirmation(signal) = self.confirmed = signal.presence
+end
+```
+
+Then, you can use the `#wake_up` method to send a signal to the job:
+
+```ruby
+# from the controller
+BulkImportJob.workflow_runs.for(import).live.sole.wake_up(:confirmation, true)
+```
+
+A signal sent before the `await` line is stored in the durable state and is replayed as soon as the job reaches this step. So, you can have multiple awaiting steps receiving signals in any order. A second signal for the same name overwrites the first.
+
+If no signal received and the deadline is specified (`wait:`, `wait_until:`), the signal handler is called with the `nil` signal, so you can decide on how to continue.
+
+You can find all the jobs waiting for a particular signal using the corresponding scope:
+
+```ruby
+CardGenerationJob.workflow_runs.awaiting.at_step(:review)
+```
 
 ## Contributing
 

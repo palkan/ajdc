@@ -120,8 +120,7 @@ class ActiveJob::ResumingTest < ActiveSupport::TestCase
 
   test "resume! after halt_on re-runs the halted step from its cursor" do
     DataImportJob.failure = ["c", InsufficientStorageError]
-    DataImportJob.perform_later(@import, %w[a b c d e])
-    perform_enqueued_jobs
+    perform_enqueued_jobs { DataImportJob.perform_later(@import, %w[a b c d e]) }
 
     run = Run.sole
     assert_equal "halted", run.status
@@ -156,8 +155,7 @@ class ActiveJob::ResumingTest < ActiveSupport::TestCase
 
   test "resume! after halt! re-runs the halted step and the later steps follow" do
     cable = Card.create!(title: "Cable")
-    DiagnosticJob.perform_later(cable)
-    2.times { perform_enqueued_jobs }
+    perform_enqueued_jobs { DiagnosticJob.perform_later(cable) }
 
     run = Run.sole
     assert_equal "halted", run.status
@@ -165,10 +163,8 @@ class ActiveJob::ResumingTest < ActiveSupport::TestCase
     assert_equal 1, run.resumptions
 
     DiagnosticJob.websocket_ok = true
-    run.resume!
+    perform_enqueued_jobs { run.resume! } # websocket_status, then admin_api_status in its own execution
     assert_nil run.halt_reason
-
-    2.times { perform_enqueued_jobs } # websocket_status, then admin_api_status in its own execution
     run.reload
 
     assert_equal "completed", run.status
@@ -186,16 +182,14 @@ class ActiveJob::ResumingTest < ActiveSupport::TestCase
 
   test "resume! after a halt mid-loop re-enters the loop step" do
     chat = Chat.create!(turn_limit: 5, approval_turn: 2)
-    AgentRunJob.perform_later(chat)
-    perform_enqueued_jobs
+    perform_enqueued_jobs { AgentRunJob.perform_later(chat) }
 
     run = Run.sole
     assert_equal "halted", run.status
     assert_equal 2, chat.reload.turns
 
     chat.approve!
-    run.resume!
-    perform_enqueued_jobs
+    perform_enqueued_jobs { run.resume! }
     run.reload
 
     assert_equal "completed", run.status
@@ -238,8 +232,7 @@ class ActiveJob::ResumingTest < ActiveSupport::TestCase
 
   test "resume! raises NotResumable unless the run is halted or failed" do
     card = Card.create!(title: "Card", state: "ready")
-    FetchJob.perform_later(card)
-    perform_enqueued_jobs
+    perform_enqueued_jobs { FetchJob.perform_later(card) }
     run = Run.sole
     assert_equal "completed", run.status
 
@@ -255,8 +248,7 @@ class ActiveJob::ResumingTest < ActiveSupport::TestCase
 
   test "a second resume! of the same run raises" do
     DataImportJob.failure = ["c", InsufficientStorageError]
-    DataImportJob.perform_later(@import, %w[a b c])
-    perform_enqueued_jobs
+    perform_enqueued_jobs { DataImportJob.perform_later(@import, %w[a b c]) }
 
     run = Run.sole
     stale = Run.find(run.id)
@@ -268,8 +260,7 @@ class ActiveJob::ResumingTest < ActiveSupport::TestCase
 
   test "resume! inside a transaction enqueues after the commit" do
     DataImportJob.failure = ["c", InsufficientStorageError]
-    DataImportJob.perform_later(@import, %w[a b c])
-    perform_enqueued_jobs
+    perform_enqueued_jobs { DataImportJob.perform_later(@import, %w[a b c]) }
     run = Run.sole
 
     ActiveRecord::Base.transaction do
