@@ -119,19 +119,18 @@ class ActiveJob::QueryingTest < ActiveSupport::TestCase
   end
 
   test "identified_by rejects a name that is not a perform parameter" do
-    error = assert_raises(ArgumentError) do
-      Class.new(BaseJob) do
-        def perform(card, style:)
-          super
-        end
-
-        identified_by :card, :kind
+    job_class = Class.new(BaseJob) do
+      def perform(card, style:)
+        super
       end
+
+      identified_by :card, :kind
     end
-    assert_equal "identified_by: unknown perform parameter :kind (perform(card, style:) has card, style)", error.message
+    error = assert_raises(ArgumentError) { job_class.perform_later(@card, style: "plain") }
+    assert_equal "unknown perform identifier parameters [:kind] (perform has card, style)", error.message
 
     error = assert_raises(ArgumentError) { LateCheckedJob.perform_later(@card) }
-    assert_equal "identified_by: unknown perform parameter :kind (perform(card) has card)", error.message
+    assert_equal "unknown perform identifier parameters [:kind] (perform has card)", error.message
     assert_equal 0, Run.count
   end
 

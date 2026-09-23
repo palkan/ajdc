@@ -199,16 +199,15 @@ class ActiveJob::UniquenessTest < ActiveSupport::TestCase
   end
 
   test "unique_by checks the names" do
-    error = assert_raises(ArgumentError) do
-      Class.new(ImportJob) do
-        def perform(card, format = nil)
-          super
-        end
-
-        unique_by :kind
+    job_class = Class.new(ImportJob) do
+      def perform(card, format = nil)
+        super
       end
+
+      unique_by :kind
     end
-    assert_equal "unique_by: unknown perform parameter :kind (perform(card, format = ...) has card, format)", error.message
+    error = assert_raises(ArgumentError) { job_class.perform_later(@card) }
+    assert_equal "unknown perform identifier parameters [:kind] (perform has card, format)", error.message
 
     error = assert_raises(ArgumentError) { Class.new(ImportJob) { unique_by :card, on_conflict: :merge } }
     assert_match(/on_conflict/, error.message)

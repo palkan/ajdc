@@ -62,7 +62,7 @@ module ActiveJob
         next where(key: kwargs[:workflow_key]) if kwargs.key?(:workflow_key)
 
         job_class = where_values_hash["job_class"] or raise ArgumentError, "for needs a job class; use MyJob.workflow_runs.for(...)"
-        where(key: job_class.constantize.durable_key_for(*args, **kwargs))
+        where(key: job_class.constantize.durable_config.workflow_key(*args, **kwargs))
       }
 
       def self.wake_due(now = Time.current)

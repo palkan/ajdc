@@ -32,6 +32,8 @@ module ActiveJob
     extend ActiveSupport::Concern
     include ActiveJob::Continuable::Callbacks
 
+    autoload :ArgsMapper, "active_job/durable/args_mapper"
+    autoload :Config, "active_job/durable/config"
     autoload :Continuation, "active_job/durable/continuation"
     autoload :Record, "active_job/durable/record"
     autoload :Run, "active_job/durable/run"
@@ -92,14 +94,7 @@ module ActiveJob
     class Cancelled < Exception # rubocop:disable Lint/InheritException
     end
 
-    ON_CONFLICT = %i[skip reject replace].freeze
-
     included do
-      class_attribute :durable_identity, instance_writer: false
-      class_attribute :durable_uniqueness, instance_writer: false
-      class_attribute :durable_on_conflict, instance_writer: false, default: :skip
-      class_attribute :durable_halt_errors, instance_writer: false, default: []
-
       self.continuation_class = Continuation
 
       # Ensure run checkpoints are written before any other callback
@@ -128,10 +123,7 @@ module ActiveJob
       #
       # Without a declaration every argument is a component: positional in order,
       # then keywords sorted by name as `name=value`.
-      def identified_by(*names, &block)
-        durable_check_identity!(:identified_by, names) if !block && method_defined?(:perform, false)
-        self.durable_identity = block || names
-      end
+      def identified_by(...) = durable_config.identified_by(...)
 
       # Specicy the run uniqueness components in the same forms as `identified_by`.
       # Uniqueness is only enforced for runs that hasn't been terminated:  either _live_ runs
@@ -142,20 +134,12 @@ module ActiveJob
       #   unique_by :payout, on_conflict: :reject   # raise `RunAlreadyExists`
       #   unique_by :license, on_conflict: :replace # cancel that run and start this one
       #
-      def unique_by(*names, on_conflict: :skip, &block)
-        unless ON_CONFLICT.include?(on_conflict)
-          raise ArgumentError, "unique_by: on_conflict must be one of #{ON_CONFLICT.map(&:inspect).join(", ")}, got #{on_conflict.inspect}"
-        end
-
-        durable_check_identity!(:unique_by, names) if !block && method_defined?(:perform, false)
-        self.durable_uniqueness = block || names
-        self.durable_on_conflict = on_conflict
-      end
+      def unique_by(*names, on_conflict: :skip, &block) = durable_config.unique_by(*names, on_conflict:, &block)
 
       # Errors that could be resolved by a human (or alike), so the run
       # could be restarted from the current step/cursor.
       def halt_on(*errors)
-        self.durable_halt_errors += errors
+        durable_config.halt_on(*errors)
         rescue_from(*errors) { |error| durable_halt!(error) }
       end
 
@@ -164,26 +148,9 @@ module ActiveJob
       # `for(workflow_key: "...")` matches a key verbatim.
       def workflow_runs = Run.where(job_class: name).newest_first
 
-      # The key `perform_later(*args, **kwargs)` builds.
-      def durable_key_for(...) = new(...).send(:durable_key) # :nodoc:
-
-      def durable_check_identity!(macro, names) # :nodoc:
-        parameters = instance_method(:perform).parameters
-        known = parameters.filter_map { |type, name| name if %i[req opt key keyreq].include?(type) }
-        unknown = names.find { |name| !known.include?(name) } or return
-
-        signature = parameters.map do |type, name|
-          case type
-          when :req then name.to_s
-          when :opt then "#{name} = ..."
-          when :rest then "*#{name}"
-          when :keyreq then "#{name}:"
-          when :key then "#{name}: ..."
-          when :keyrest then "**#{name}"
-          when :block then "&#{name}"
-          end
-        end.join(", ")
-        raise ArgumentError, "#{macro}: unknown perform parameter #{unknown.inspect} (perform(#{signature}) has #{known.join(", ")})"
+      # Macros write to this class's own copy of its parent's configuration.
+      def durable_config # :nodoc:
+        @durable_config ||= superclass.respond_to?(:durable_config) ? superclass.durable_config.inherit(self) : Config.new(self)
       end
     end
 
@@ -356,7 +323,7 @@ module ActiveJob
       durable_step_completed!(step)
     end
 
-    def durable_halt?(error) = error.is_a?(Halt) || durable_halt_errors.any? { |klass| error.is_a?(klass) }
+    def durable_halt?(error) = error.is_a?(Halt) || self.class.durable_config.halt_error?(error)
 
     def durable_halt!(error)
       halt = error.is_a?(Halt)
@@ -384,7 +351,7 @@ module ActiveJob
       attributes = {
         job_class: self.class.name,
         key: durable_key,
-        active_key: (durable_active_key if durable_uniqueness),
+        active_key: (durable_active_key if self.class.durable_config.unique?),
         arguments: serialize_arguments_if_needed(arguments),
         state: durable_state,
         transitioned_at: Time.current
@@ -406,7 +373,7 @@ module ActiveJob
     # race between two first enqueues, and the loser looks again, once.
     def durable_create_run(attributes, retried: false)
       Run.transaction(requires_new: true) do
-        if durable_uniqueness && (live = durable_live_run(attributes[:active_key]))
+        if self.class.durable_config.unique? && (live = durable_live_run(attributes[:active_key]))
           durable_resolve_conflict!(live) or next
         end
         Run.create!(active_job_id: job_id, **attributes)
@@ -419,7 +386,7 @@ module ActiveJob
 
     # True when this run may be inserted.
     def durable_resolve_conflict!(live)
-      case durable_on_conflict
+      case self.class.durable_config.on_conflict
       when :skip
         @durable_conflict = live
         false
@@ -652,78 +619,22 @@ module ActiveJob
 
     def durable_resumptions = continuation.started? ? resumptions + 1 : resumptions
 
-    # The run's identity inside the class: `set(workflow_key:)` verbatim, else the
-    # `identified_by` components (or every argument) rendered and joined with ":".
+    # The run's identity inside the class: `set(workflow_key:)` verbatim, else
+    # the configured one.
     def durable_key
       return @durable_workflow_key if @durable_workflow_key
+      return Config.digest_key(serialize_arguments_if_needed(arguments)) if arguments_serialized?
 
-      if durable_identity || !durable_uniqueness
-        durable_render_key(durable_identity, :identified_by)
-      else
-        durable_render_key(durable_uniqueness, :unique_by)
-      end
+      self.class.durable_config.workflow_key(*arguments)
     end
 
     # The identity one run holds at a time: `set(workflow_key:)` verbatim, else
-    # the `unique_by` components.
-    def durable_active_key = @durable_workflow_key || durable_render_key(durable_uniqueness, :unique_by)
+    # the configured one.
+    def durable_active_key
+      return @durable_workflow_key if @durable_workflow_key
+      return Config.digest_key(serialize_arguments_if_needed(arguments)) if arguments_serialized?
 
-    def durable_render_key(identity, macro)
-      components = arguments_serialized? ? [] : durable_identity_components(identity, macro)
-      if components.empty?
-        Digest::SHA256.hexdigest(ActiveSupport::JSON.encode(serialize_arguments_if_needed(arguments)))
-      else
-        components.map { |component| durable_key_component(component) }.join(":")
-      end
-    end
-
-    def durable_identity_components(identity, macro)
-      positional, keywords = durable_split_arguments
-
-      if identity.is_a?(Proc)
-        value = identity.call(*positional, **keywords)
-        value.is_a?(Array) ? value : [value]
-      elsif identity.present?
-        self.class.durable_check_identity!(macro, identity)
-        identity.map { |name| durable_named_component(name, positional, keywords) }
-      else
-        positional + keywords.sort_by { |name, _| name.to_s }.map { |name, value| "#{name}=#{durable_key_component(value)}" }
-      end
-    end
-
-    def durable_named_component(name, positional, keywords)
-      parameters = self.class.instance_method(:perform).parameters
-      positional_names = parameters.filter_map { |type, parameter| parameter if type == :req || type == :opt }
-
-      if (index = positional_names.index(name))
-        positional[index]
-      else
-        keywords[name]
-      end
-    end
-
-    # Active Job stores keyword arguments as a trailing ruby2_keywords hash.
-    def durable_split_arguments
-      positional = arguments.dup
-      keywords = (positional.last.is_a?(Hash) && Hash.ruby2_keywords_hash?(positional.last)) ? positional.pop : {}
-      [positional, keywords.transform_keys(&:to_sym)]
-    end
-
-    def durable_key_component(value)
-      case value
-      when GlobalID::Identification then "#{durable_collection_name(value)}/#{value.id}"
-      when Symbol, String, Integer, Float, true, false then value.to_s
-      when nil then ""
-      else Digest::SHA256.hexdigest(ActiveSupport::JSON.encode(Arguments.serialize([value])))[0, 16]
-      end
-    end
-
-    def durable_collection_name(record)
-      if record.respond_to?(:model_name)
-        record.model_name.collection
-      else
-        ActiveModel::Name.new(record.class).collection
-      end
+      self.class.durable_config.active_key(*arguments)
     end
 
     def durable_step_method(step_name)
