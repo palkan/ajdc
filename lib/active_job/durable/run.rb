@@ -69,6 +69,19 @@ module ActiveJob
         due(now).find_each.count { |run| run.reenqueue_parked_job!(from: WAKEABLE_STATUSES) }
       end
 
+      # Deletes the terminal runs that ended before `ended_before`, with their
+      # steps, one batch per transaction; returns how many. A terminal row is
+      # never written again, so `transitioned_at` is when it ended (and is indexed).
+      def self.clear_terminal(ended_before:, batch_size: 1_000)
+        terminal.where(transitioned_at: ...ended_before).in_batches(of: batch_size).sum do |batch|
+          ids = batch.ids
+          transaction do
+            Step.where(run_id: ids).delete_all
+            where(id: ids).delete_all
+          end
+        end
+      end
+
       def live? = LIVE_STATUSES.include?(status)
 
       def attention? = ATTENTION_STATUSES.include?(status)

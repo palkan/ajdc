@@ -36,6 +36,7 @@ module ActiveJob
     autoload :Config, "active_job/durable/config"
     autoload :Continuation, "active_job/durable/continuation"
     autoload :Execution, "active_job/durable/execution"
+    autoload :HousekeepingJob, "active_job/durable/housekeeping_job"
     autoload :Record, "active_job/durable/record"
     autoload :Run, "active_job/durable/run"
     autoload :Step, "active_job/durable/step"
@@ -43,9 +44,21 @@ module ActiveJob
 
     mattr_accessor :connects_to, instance_accessor: false
 
+    # How long `clean_up` keeps a `completed`, `discarded` or `cancelled` run
+    # (and its steps) after it ended; `nil` keeps them forever.
+    mattr_accessor :keep_terminal_runs_for, instance_accessor: false, default: 14.days
+
     # Wakes every `waiting` or `awaiting` run whose `wake_at` has passed, once each, and
     # returns how many. `WakeJob` calls it on schedule; tests call it inside `travel_to`.
     def self.wake_up_due = Run.wake_due
+
+    # Deletes the terminal runs older than `keep_terminal_runs_for`, with their
+    # steps, and returns how many. `HousekeepingJob` calls it on schedule.
+    def self.clean_up
+      return 0 unless keep_terminal_runs_for
+
+      Run.clear_terminal(ended_before: keep_terminal_runs_for.ago)
+    end
 
     # Raised inside `perform_now` when the payload references a run row that does
     # not exist (or belongs to another job), so `retry_on`, `discard_on` and

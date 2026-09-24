@@ -1,4 +1,4 @@
 # frozen_string_literal: true
 
 # ActiveJob::Durable keeps its runs and steps in the "<%= options[:database] %>" database.
-ActiveJob::Durable.connects_to = { database: { writing: :<%= options[:database] %> } }
+Rails.application.config.active_job_durable.connects_to = { database: { writing: :<%= options[:database] %> } }

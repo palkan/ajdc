@@ -51,7 +51,7 @@ bin/rails db:prepare
 
 ```ruby
 # config/initializers/active_job_durable.rb (generated)
-ActiveJob::Durable.connects_to = { database: { writing: :durable } }
+Rails.application.config.active_job_durable.connects_to = { database: { writing: :durable } }
 ```
 
 ### Requirements
@@ -373,6 +373,32 @@ You can find all the jobs waiting for a particular signal using the correspondin
 ```ruby
 CardGenerationJob.workflow_runs.awaiting.at_step(:review)
 ```
+
+### Housekeeping
+
+Terminal runs (`completed`, `discarded`, `cancelled`) and their steps are kept for 14 days after they end. To delete the older ones, schedule `ActiveJob::Durable::HousekeepingJob`, e.g., with Solid Queue:
+
+```yaml
+# config/recurring.yml
+durable_housekeeping:
+  class: ActiveJob::Durable::HousekeepingJob
+  schedule: every hour
+```
+
+Configure the retention period (`nil` keeps runs forever):
+
+```ruby
+# config/application.rb
+config.active_job_durable.keep_terminal_runs_for = 30.days
+```
+
+Runs that need attention (`failed`, `halted`) are never deleted. Stuck runs are left to the application: `stuck_for` finds `enqueued` runs whose message never arrived, `running` runs whose worker died (no heartbeat), and parked runs the clock missed, and `cancel!` ends any of them:
+
+```ruby
+ActiveJob::Durable::Run.stuck_for(1.hour).running.find_each(&:cancel!)
+```
+
+A heartbeat is written at every step boundary and checkpoint, so pick a duration longer than the longest stretch of a step without a checkpoint.
 
 ## Contributing
 
