@@ -38,17 +38,7 @@ module ActiveJob
       end
 
       def step(step_name, start: nil, isolated: false, **options, &block)
-        unless block
-          step_method = method(step_name)
-
-          raise ArgumentError, "Step method '#{step_name}' must accept 0 or 1 arguments" if step_method.arity > 1
-
-          if step_method.parameters.any? { |type, _name| type == :key || type == :keyreq }
-            raise ArgumentError, "Step method '#{step_name}' must not accept keyword arguments"
-          end
-
-          block = (step_method.arity == 0) ? ->(_step) { step_method.call } : step_method
-        end
+        block ||= step_method_block(step_name)
         checkpoint! if continuation.advanced?
         continuation.step(step_name, start:, isolated:, **options, &block)
       end
@@ -64,6 +54,21 @@ module ActiveJob
           super
           self.continuation = continuation_class.new(self, job_data.fetch("continuation", {}))
         end
+      end
+
+      private
+
+      # The method named after the step, as a step block.
+      def step_method_block(step_name)
+        step_method = method(step_name)
+
+        raise ArgumentError, "Step method '#{step_name}' must accept 0 or 1 arguments" if step_method.arity > 1
+
+        if step_method.parameters.any? { |type, _name| type == :key || type == :keyreq }
+          raise ArgumentError, "Step method '#{step_name}' must not accept keyword arguments"
+        end
+
+        (step_method.arity == 0) ? ->(_step) { step_method.call } : step_method
       end
     end
   end

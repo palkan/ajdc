@@ -35,6 +35,7 @@ module ActiveJob
     autoload :ArgsMapper, "active_job/durable/args_mapper"
     autoload :Config, "active_job/durable/config"
     autoload :Continuation, "active_job/durable/continuation"
+    autoload :Execution, "active_job/durable/execution"
     autoload :Record, "active_job/durable/record"
     autoload :Run, "active_job/durable/run"
     autoload :Step, "active_job/durable/step"
@@ -98,15 +99,14 @@ module ActiveJob
       self.continuation_class = Continuation
 
       # Ensure run checkpoints are written before any other callback
-      around_step :durable_step, prepend: true
+      around_step(prepend: true) { |_job, block| durable_job.step(&block) }
 
       # Add our hook before Continuable's `around_perform :continue`,
       # so we can wrap it
-      around_perform :durable_perform, prepend: true
+      around_perform(prepend: true) { |_job, block| durable_job.perform(&block) }
 
-      after_discard { |_job, error| @durable_discarded_error = error }
-      rescue_from(Halt) { |error| durable_halt!(error) }
-      rescue_from(Cancelled) { durable_step_finished!("cancelled") }
+      after_discard { |_job, error| durable_job.record_discard(error) }
+      rescue_from(Halt) { |error| durable_job.halted!(error) }
     end
 
     module ClassMethods
@@ -140,7 +140,7 @@ module ActiveJob
       # could be restarted from the current step/cursor.
       def halt_on(*errors)
         durable_config.halt_on(*errors)
-        rescue_from(*errors) { |error| durable_halt!(error) }
+        rescue_from(*errors) { |error| durable_job.halted!(error) }
       end
 
       # This class's runs, newest first. `for(*args, **kwargs)` on the relation
@@ -158,16 +158,15 @@ module ActiveJob
     # part of the caller's transaction when enqueuing is deferred to after commit.
     # A retry or resume (same `job_id`) finds the row and only updates its status.
     def enqueue(options = {})
-      @durable_workflow_key = options[:workflow_key]&.to_s
-      durable_run_enqueued!
-      return false if @durable_conflict # `on_conflict: :skip`: nothing to enqueue
+      durable_job.workflow_key = options[:workflow_key]&.to_s
+      return false unless durable_job.enqueued! # `on_conflict: :skip`: nothing to enqueue
 
       super
     end
 
     # Supports `set(workflow_key: "...")`to provide an explicit workflow (not run) identifier.
     def set(options = {}) # :nodoc:
-      @durable_workflow_key = options[:workflow_key]&.to_s
+      durable_job.workflow_key = options[:workflow_key]&.to_s
       super
     end
 
@@ -196,8 +195,8 @@ module ActiveJob
     # consumed on the spot. The step row's cursor keeps the value, so a crash in
     # the handler replays it; a `halt!` in the handler awaits again on resume.
     def await(name, wait: nil, wait_until: nil, &block)
-      handler = block || durable_step_method(name)
-      step(name, wait:, wait_until:, await: true) { handler.call(@durable_await_value) }
+      handler = block || step_method_block(name)
+      step(name, wait:, wait_until:, await: true) { handler.call(durable_job.await_value) }
     end
 
     # Stops the run from inside a step: status `halted` with `halt_reason`, the
@@ -209,444 +208,31 @@ module ActiveJob
     end
 
     def checkpoint! # :nodoc:
-      durable_checkpoint!
+      durable_job.checkpoint!
       super
     end
 
-    # The run must be the only source of truth, so drop the base continuation
-    # parameters from the payload. A workflow key travels only until the row
-    # exists (`perform_all_later` creates it at the first execution).
-    def serialize # :nodoc:
-      payload = super.except("continuation", "attributes", "resumptions").merge("durable_run_id" => @durable_run&.id)
-      payload["durable_workflow_key"] = @durable_workflow_key if @durable_workflow_key && !@durable_run
-      payload
-    end
+    def serialize = durable_job.serialize(super) # :nodoc:
 
     def deserialize(job_data) # :nodoc:
       super
-      @durable_run_id = job_data["durable_run_id"]
-      @durable_workflow_key = job_data["durable_workflow_key"]
+      durable_job.deserialize(job_data)
     end
 
-    # A run is `discarded` when Active Job swallowed the error and `failed` when the
-    # error is raised to the backend; a retried job is `enqueued` again by `enqueue`.
-    def perform_now # :nodoc:
-      @durable_discarded_error = nil
-      result = super
-      durable_run_discarded!(@durable_discarded_error) if @durable_discarded_error
-      result
-    rescue Exception => err # rubocop:disable Lint/RescueException
-      durable_run_failed!(err) unless @durable_conflict
-      raise
-    end
+    def perform_now = durable_job.perform_now { super } # :nodoc:
 
     private
 
+    def durable_job = @durable_job ||= Execution.new(self)
+
     def deserialize_arguments_if_needed
       super
-      durable_restore_from_run! if @durable_run_id
-    end
-
-    def durable_restore_from_run!
-      run_id, @durable_run_id = @durable_run_id, nil
-      run = Run.find_by(id: run_id, active_job_id: job_id)
-      raise RunNotFoundError, "Run #{run_id} for #{self.class.name} (Job ID: #{job_id}) was not found" unless run
-
-      @durable_run = run
-      @durable_state_written = run.serialized_state
-      @durable_deadline, @durable_deadline_step = run.wake_at, run.current_step
-      self.resumptions = run.resumptions
-      self.continuation = continuation_class.new(self, durable_serialized_progress(run))
-      # A run that starts from its parked job was re-enqueued by `resume!` (or by
-      # the backend), not by Continuation, so it is not one of its resumptions;
-      # `continue` still adds one when the run has progress, so start one below.
-      self.resumptions -= 1 if run.parked_job.present? && continuation.started?
-      if run.state.present? && respond_to?(:deserialize_attribute_values, true)
-        deserialize_attribute_values(run.serialized_state)
-      end
-    end
-
-    def durable_serialized_progress(run)
-      progress = {"completed" => Array(run.completed_steps)}
-      if run.current_step && (cursor, _ = Step.where(run_id: run.id, name: run.current_step).order(attempt: :desc).pick(:cursor, :attempt))
-        progress["current"] = [run.current_step, durable_cursor_for_continuation(cursor)]
-      end
-      progress
-    end
-
-    def durable_cursor_for_continuation(serialized_cursor)
-      if Continuation.private_method_defined?(:serialized_current)
-        serialized_cursor # Rails 8.2+
-      else
-        Arguments.deserialize([serialized_cursor]).first # Rails <8.2
-      end
+      durable_job.restore!
     end
 
     def resume_job(exception) # :nodoc:
       error = exception.is_a?(Hash) ? exception[:exception] : exception
-      raise error if durable_halt?(error)
-
-      @durable_resumed = true
-      return if @durable_parked # the row is written; the clock or a signal re-enqueues
-
-      if error.is_a?(Continuation::Interrupt)
-        durable_step_finished!("interrupted") # Rails 8.2+
-      else
-        durable_step_finished!("failed", error:) # Rails <8.2
-      end
-      durable_write_running!(state: durable_state, resumptions:, last_heartbeat_at: Time.current)
-      super
-    end
-
-    # Wraps Continuable's `continue`.
-    def durable_perform
-      return if durable_run&.terminal? # cancelled while the job was in the queue
-
-      @durable_step = nil
-      @durable_resumed = false
-      @durable_parked = false
-      durable_run_started! or return # a bulk-enqueued job whose key another run holds
-      yield
-      durable_run_completed! unless @durable_resumed
-    rescue Exception => error # rubocop:disable Lint/RescueException
-      durable_step_finished!("failed", error:) unless durable_halt?(error) || error.is_a?(Cancelled)
-      raise
-    end
-
-    # The step's durability checkpoints: park it on a timer or a signal, then
-    # record it as started and, once its body and callbacks have run, completed.
-    def durable_step
-      step, options = current_step, continuation.step_options
-      durable_wait!(step, **options.slice(:wait, :wait_until, :await)) if options.values_at(:wait, :wait_until, :await).any?
-      durable_step_started!(step, **options.slice(:isolated, :await))
-      yield
-      durable_step_completed!(step)
-    end
-
-    def durable_halt?(error) = error.is_a?(Halt) || self.class.durable_config.halt_error?(error)
-
-    def durable_halt!(error)
-      halt = error.is_a?(Halt)
-      durable_step_finished!("halted", error: (error unless halt))
-      durable_write_run(
-        if_status: "running",
-        status: "halted",
-        state: durable_state,
-        resumptions:,
-        parked_job: serialize,
-        halt_reason: (error.reason&.to_s if halt),
-        error_class: (error.class.name unless halt),
-        error_message: (error.message unless halt),
-        transitioned_at: Time.current
-      )
-    end
-
-    def durable_run = @durable_run ||= Run.find_by(active_job_id: job_id)
-
-    # Last write wins, within `if_status:`. False, and nothing written, when the
-    # row was not created because another run holds the key (`on_conflict: :skip`).
-    def durable_upsert_run!(if_status: nil, **attributes)
-      return durable_write_run(if_status:, **attributes) if durable_run
-
-      attributes = {
-        job_class: self.class.name,
-        key: durable_key,
-        active_key: (durable_active_key if self.class.durable_config.unique?),
-        arguments: serialize_arguments_if_needed(arguments),
-        state: durable_state,
-        transitioned_at: Time.current
-      }.merge(attributes)
-      run = durable_create_run(attributes) or return false
-      @durable_run = run
-
-      if run.previously_new_record?
-        @durable_state_written = attributes[:state]
-        true
-      else
-        durable_write_run(if_status:, **attributes)
-      end
-    end
-
-    # Inserts the row; finds it instead when this job is already recorded (two
-    # executions of one job). With `unique_by`, a run holding the same
-    # `active_key` decides first, by `on_conflict`; the unique index settles a
-    # race between two first enqueues, and the loser looks again, once.
-    def durable_create_run(attributes, retried: false)
-      Run.transaction(requires_new: true) do
-        if self.class.durable_config.unique? && (live = durable_live_run(attributes[:active_key]))
-          durable_resolve_conflict!(live) or next
-        end
-        Run.create!(active_job_id: job_id, **attributes)
-      end
-    rescue ActiveRecord::RecordNotUnique
-      Run.find_by(active_job_id: job_id) || (retried ? raise : durable_create_run(attributes, retried: true))
-    end
-
-    def durable_live_run(active_key) = Run.find_by(job_class: self.class.name, active_key:)
-
-    # True when this run may be inserted.
-    def durable_resolve_conflict!(live)
-      case self.class.durable_config.on_conflict
-      when :skip
-        @durable_conflict = live
-        false
-      when :reject
-        @durable_conflict = live
-        raise RunAlreadyExists.new(live)
-      when :replace
-        begin
-          live.cancel!
-        rescue NotCancellable
-          # ended meanwhile: its key is free
-        end
-        true
-      end
-    end
-
-    # A re-enqueue of a cancelled run leaves the row alone; the queued job
-    # then performs nothing.
-    def durable_run_enqueued!
-      attributes = {status: "enqueued", finished_at: nil, transitioned_at: Time.current}
-      attributes[:state] = durable_state unless @durable_run_id # a job built from its payload has not read the row yet
-      durable_upsert_run!(if_status: Run::CANCELLABLE_STATUSES, **attributes)
-    end
-
-    def durable_run_started!
-      now = Time.current
-      written = durable_upsert_run!(
-        if_status: Run::CANCELLABLE_STATUSES,
-        status: "running",
-        started_at: durable_run&.started_at || now,
-        last_heartbeat_at: now,
-        resumptions: durable_resumptions,
-        parked_job: nil,
-        transitioned_at: now
-      )
-      return false if @durable_conflict
-
-      written or raise Cancelled, "Run #{durable_run.id} was cancelled"
-    end
-
-    def durable_run_completed!
-      now = Time.current
-      durable_write_running!(
-        status: "completed",
-        current_step: nil,
-        active_key: nil,
-        state: durable_state,
-        resumptions:,
-        finished_at: now,
-        transitioned_at: now
-      )
-    end
-
-    def durable_run_failed!(error)
-      now = Time.current
-      durable_upsert_run!(
-        if_status: Run::CANCELLABLE_STATUSES,
-        status: "failed",
-        state: durable_state,
-        resumptions:,
-        parked_job: serialize,
-        error_class: error.class.name,
-        error_message: error.message,
-        finished_at: now,
-        transitioned_at: now
-      )
-    end
-
-    def durable_run_discarded!(error)
-      now = Time.current
-      durable_upsert_run!(
-        if_status: Run::CANCELLABLE_STATUSES,
-        status: "discarded",
-        active_key: nil,
-        error_class: error.class.name,
-        error_message: error.message,
-        finished_at: now,
-        transitioned_at: now
-      )
-    end
-
-    # One UPDATE, no callbacks or validations; the loaded row is not refreshed.
-    # `if_status:` guards the statement with the row's current status: false,
-    # and nothing written, when the run left that status meanwhile.
-    def durable_write_run(if_status: nil, **attributes)
-      run = durable_run or return true
-
-      @durable_state_written = attributes[:state] if attributes.key?(:state)
-      scope = Run.where(id: run.id)
-      scope = scope.where(status: if_status) if if_status
-      scope.update_all(**attributes, updated_at: Time.current).positive?
-    end
-
-    # The only way a `running` run changes status from outside is `Run#cancel!`.
-    def durable_write_running!(**attributes)
-      durable_write_run(if_status: "running", **attributes) or raise Cancelled, "Run #{durable_run.id} was cancelled"
-    end
-
-    # The guarded run write comes first, so a cancelled run gets no row for a
-    # step that never started. A signal for this step is consumed here, under
-    # the row lock `Run#wake_up` takes, and lands in the step row's cursor.
-    def durable_step_started!(step, isolated:, await:)
-      run = durable_run or return
-      name = step.name.to_s
-
-      @durable_step_await = await
-      Run.transaction do
-        signals = durable_pending_signals(lock: true)
-        attributes = {current_step: name, wake_at: nil}
-        if signals.key?(name)
-          attributes[:pending_signals] = signals.except(name)
-          @durable_await_value = signals[name] if @durable_step_await
-        end
-        durable_write_running!(**attributes)
-
-        @durable_step = run.steps.create(
-          name:,
-          position: continuation.instrumentation[:completed_steps].size + 1,
-          attempt: Step.where(run_id: run.id, name:).maximum(:attempt).to_i + 1,
-          status: "started",
-          cursor: durable_serialize_cursor(durable_step_cursor(step)),
-          isolated:,
-          started_at: Time.current
-        )
-      end
-      @durable_deadline = nil
-    end
-
-    # The guarded run write comes first: a step whose completion the cancelled
-    # run did not record is closed as `cancelled`, like one stopped mid-way.
-    def durable_step_completed!(step)
-      step_row = @durable_step or return
-      now = Time.current
-      completed_steps = continuation.instrumentation[:completed_steps].map(&:to_s) << step.name.to_s
-      durable_write_running!(completed_steps:, current_step: nil, state: durable_state, last_heartbeat_at: now)
-
-      @durable_step = nil
-      step_row.update_columns(status: "completed", cursor: durable_serialize_cursor(durable_step_cursor(step)), finished_at: now)
-    end
-
-    def durable_step_finished!(status, error: nil)
-      step_row = @durable_step or return
-      @durable_step = nil
-      current = continuation.instrumentation[:current_step]
-
-      step_row.update_columns(
-        status:,
-        cursor: current ? durable_serialize_cursor(durable_step_cursor(current)) : step_row.cursor,
-        error_class: error&.class&.name,
-        error_message: error&.message,
-        finished_at: Time.current
-      )
-    end
-
-    # Parks the run when the step's signal has not arrived and its deadline has
-    # not passed: the row is written under the row lock (so a signal sent
-    # meanwhile finds it `awaiting` and wakes it), then the job is interrupted
-    # and `resume_job` leaves it to the clock or to `Run#wake_up`. A resumed
-    # step does not wait again, except an `await` whose handler halted.
-    def durable_wait!(step, wait:, wait_until:, await:)
-      durable_run or return
-      name = step.name.to_s
-      resumed = step.resumed? && !(await && durable_halted?(name))
-      @durable_await_value = (step.cursor if resumed) if await
-      return if resumed
-
-      status = Run.transaction do
-        next if durable_pending_signals(lock: true).key?(name)
-
-        deadline = durable_deadline(name, wait, wait_until)
-        next if deadline && deadline <= Time.current
-
-        parked = await ? "awaiting" : "waiting"
-        durable_write_running!(
-          status: parked, current_step: name, wake_at: deadline, state: durable_state, resumptions:,
-          parked_job: serialize, transitioned_at: Time.current
-        )
-        @durable_deadline, @durable_deadline_step = deadline, name
-        parked
-      end
-      return unless status
-
-      @durable_parked = true
-      interrupt!(reason: status.to_sym)
-    end
-
-    # A `wait_until:` is read again at every wake; a `wait:` counts from the
-    # first time the line is reached and is then kept on the row.
-    def durable_deadline(name, wait, wait_until)
-      if wait_until
-        durable_timer_value(wait_until)
-      elsif wait
-        (@durable_deadline if @durable_deadline_step == name) || Time.current + durable_timer_value(wait)
-      end
-    end
-
-    def durable_timer_value(value) = value.respond_to?(:call) ? value.call : value
-
-    def durable_halted?(name) = Step.where(run_id: durable_run.id, name:).order(attempt: :desc).pick(:status) == "halted"
-
-    def durable_pending_signals(lock: false)
-      scope = Run.where(id: durable_run.id)
-      scope = scope.lock if lock
-      scope.pick(:pending_signals) || {}
-    end
-
-    # An `await` step's cursor is the signal value, whatever the resumed step carries.
-    def durable_step_cursor(step) = @durable_step_await ? @durable_await_value : step.cursor
-
-    # The cursor is committed first, so a cancelled step keeps it; the guarded
-    # heartbeat write is what detects the cancel.
-    def durable_checkpoint!
-      return unless durable_run
-
-      if @durable_step && (current = continuation.instrumentation[:current_step])
-        @durable_step.update_columns(cursor: durable_serialize_cursor(durable_step_cursor(current)))
-      end
-
-      attributes = {last_heartbeat_at: Time.current}
-      state = durable_state
-      attributes[:state] = state unless state == @durable_state_written
-      durable_write_running!(**attributes)
-    end
-
-    # The attribute values as `ActiveJob::Attributes#serialize` puts them under
-    # `"attributes"`. Rails 8.1 has no Attributes.
-    def durable_state = respond_to?(:serialize_attribute_values, true) ? serialize_attribute_values : {}
-
-    def durable_serialize_cursor(cursor) = Arguments.serialize([cursor]).first
-
-    def durable_resumptions = continuation.started? ? resumptions + 1 : resumptions
-
-    # The run's identity inside the class: `set(workflow_key:)` verbatim, else
-    # the configured one.
-    def durable_key
-      return @durable_workflow_key if @durable_workflow_key
-      return Config.digest_key(serialize_arguments_if_needed(arguments)) if arguments_serialized?
-
-      self.class.durable_config.workflow_key(*arguments)
-    end
-
-    # The identity one run holds at a time: `set(workflow_key:)` verbatim, else
-    # the configured one.
-    def durable_active_key
-      return @durable_workflow_key if @durable_workflow_key
-      return Config.digest_key(serialize_arguments_if_needed(arguments)) if arguments_serialized?
-
-      self.class.durable_config.active_key(*arguments)
-    end
-
-    def durable_step_method(step_name)
-      step_method = method(step_name)
-
-      raise ArgumentError, "Step method '#{step_name}' must accept 0 or 1 arguments" if step_method.arity > 1
-
-      if step_method.parameters.any? { |type, _name| type == :key || type == :keyreq }
-        raise ArgumentError, "Step method '#{step_name}' must not accept keyword arguments"
-      end
-
-      (step_method.arity == 0) ? ->(_step) { step_method.call } : step_method
+      super if durable_job.resume!(error)
     end
   end
 end
