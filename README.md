@@ -19,7 +19,7 @@ gem "ajdc"
 
 or run `bundle add ajdc`.
 
-### Addinng agent skills
+### Adding agent skills
 
 The gem ships a skill for coding agents in `skills/ajdc`. It follows the [skills.sh](https://www.skills.sh) layout, so it works with any agent that reads `SKILL.md`.
 
